@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <optional>
+#include <string>
+#include <utility>
+
 #include "common/log_entry.hpp"
 #include "common/status.hpp"
+#include "common/status_or.hpp"
 
 namespace distkv {
 namespace {
@@ -68,6 +73,46 @@ TEST(StatusTest, ToString) {
     EXPECT_EQ(Status::not_leader("leader is node 2").to_string(), "NOT_LEADER: leader is node 2");
     EXPECT_EQ(Status::unavailable("").to_string(), "UNAVAILABLE");
     EXPECT_EQ(to_string(StatusCode::kInternal), "INTERNAL");
+}
+
+TEST(StatusOrTest, HoldsValue) {
+    StatusOr<std::string> r = std::string("hello");
+    ASSERT_TRUE(r.is_ok());
+    EXPECT_TRUE(r.status().is_ok());
+    EXPECT_EQ(r.value(), "hello");
+    EXPECT_EQ(*r, "hello");
+    EXPECT_EQ(r->size(), 5U);
+    const std::string moved = std::move(r).value();
+    EXPECT_EQ(moved, "hello");
+}
+
+TEST(StatusOrTest, HoldsError) {
+    const StatusOr<int> r = Status::not_leader("leader is node 2");
+    EXPECT_FALSE(r.is_ok());
+    EXPECT_EQ(r.status().code(), StatusCode::kNotLeader);
+    EXPECT_EQ(r.status().message(), "leader is node 2");
+}
+
+TEST(StatusOrTest, OkStatusWithoutValueBecomesInternal) {
+    const StatusOr<int> r = Status::ok();
+    EXPECT_FALSE(r.is_ok());
+    EXPECT_EQ(r.status().code(), StatusCode::kInternal);
+}
+
+TEST(StatusOrTest, OptionalValueDistinguishesAbsentFromError) {
+    const StatusOr<std::optional<std::string>> absent{std::nullopt};
+    ASSERT_TRUE(absent.is_ok());
+    EXPECT_FALSE(absent->has_value());
+
+    const StatusOr<std::optional<std::string>> present = std::optional<std::string>("v");
+    ASSERT_TRUE(present.is_ok());
+    EXPECT_EQ(*present, "v");
+}
+
+TEST(StatusOrDeathTest, ValueOnErrorAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    const StatusOr<int> r = Status::unavailable("no quorum");
+    EXPECT_DEATH((void)r.value(), "StatusOr::value\\(\\) on error: UNAVAILABLE: no quorum");
 }
 
 }  // namespace
