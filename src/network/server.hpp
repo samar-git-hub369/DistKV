@@ -49,6 +49,7 @@ private:
     asio::io_context& io_;
     asio::strand<asio::io_context::executor_type> strand_;  // Serialises acceptor use.
     asio::ip::tcp::acceptor acceptor_;
+    asio::steady_timer retry_timer_;  // Backs off after accept errors (e.g. EMFILE).
     CommandDispatcher& dispatcher_;
     const Session::Limits limits_;
     std::uint16_t port_{0};
