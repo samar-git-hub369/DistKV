@@ -18,3 +18,5 @@ distkv_add_test(local_replicator_test local_replicator_test.cpp)
 distkv_add_test(kv_store_test kv_store_test.cpp)
 
 distkv_add_test(kv_service_test kv_service_test.cpp)
+
+distkv_add_test(resp_test resp_test.cpp)
