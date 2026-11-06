@@ -7,6 +7,6 @@ target_compile_features(distkv_core PUBLIC cxx_std_20)
 distkv_set_warnings(distkv_core)
 
 add_executable(distkv-server server/main.cpp)
-target_link_libraries(distkv-server PRIVATE distkv_core)
+target_link_libraries(distkv-server PRIVATE distkv_core asio::asio)
 target_compile_definitions(distkv-server PRIVATE DISTKV_VERSION="${PROJECT_VERSION}")
 distkv_set_warnings(distkv-server)
