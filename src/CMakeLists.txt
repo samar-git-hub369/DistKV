@@ -1,6 +1,7 @@
 # distkv_core: everything except the server entry point, so tests and tools
 # can link the real code.
 add_library(distkv_core STATIC
+    protocol/resp.cpp
     replication/local_replicator.cpp
     server/kv_service.cpp
     storage/kv_store.cpp)
