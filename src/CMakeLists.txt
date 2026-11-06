@@ -2,6 +2,7 @@
 # can link the real code.
 add_library(distkv_core STATIC
     replication/local_replicator.cpp
+    server/kv_service.cpp
     storage/kv_store.cpp)
 target_include_directories(distkv_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(distkv_core PUBLIC cxx_std_20)
