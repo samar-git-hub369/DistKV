@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,9 +52,18 @@ public:
 
     // `socket` should use a strand executor (e.g. accepted with
     // asio::make_strand). `dispatcher` must outlive the session.
-    Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits);
+    //
+    // `on_closed`, if set, is called exactly once: on the strand when the
+    // connection closes, or from the destructor if it never did. The Server
+    // uses it to release the session's connection slot.
+    Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits,
+            std::function<void()> on_closed);
+    Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits)
+        : Session(std::move(socket), dispatcher, limits, nullptr) {}
     Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher)
-        : Session(std::move(socket), dispatcher, Limits{}) {}
+        : Session(std::move(socket), dispatcher, Limits{}, nullptr) {}
+
+    ~Session();
 
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
@@ -84,6 +94,7 @@ private:
     asio::ip::tcp::socket socket_;
     CommandDispatcher& dispatcher_;
     const Limits limits_;
+    std::function<void()> on_closed_;  // Reset once called.
 
     std::vector<char> read_buffer_;
     std::string input_;  // Received bytes not yet parsed.

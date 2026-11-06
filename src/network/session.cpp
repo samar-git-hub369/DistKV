@@ -8,12 +8,20 @@
 
 namespace distkv {
 
-Session::Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits)
+Session::Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits,
+                 std::function<void()> on_closed)
     : executor_(socket.get_executor()),
       socket_(std::move(socket)),
       dispatcher_(dispatcher),
       limits_(limits),
+      on_closed_(std::move(on_closed)),
       read_buffer_(limits.read_chunk_bytes) {}
+
+Session::~Session() {
+    // Only reached without do_close() if the io_context was stopped or
+    // destroyed with this session's handlers still queued.
+    if (on_closed_) on_closed_();
+}
 
 void Session::start() {
     asio::dispatch(executor_, [self = shared_from_this()] { self->do_read(); });
@@ -163,6 +171,11 @@ void Session::do_close() {
     slots_.clear();
     output_.clear();
     input_.clear();
+    if (on_closed_) {
+        auto on_closed = std::move(on_closed_);
+        on_closed_ = nullptr;
+        on_closed();
+    }
 }
 
 }  // namespace distkv
