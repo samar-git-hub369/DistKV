@@ -7,19 +7,20 @@ a single node to Raft consensus.
 
 ## Status
 
-Day 2 of 25: the build system, core types (`Command`, `LogEntry`, `Status`,
-`StatusOr`), the `Replicator` interface with a single-node `LocalReplicator`,
-a thread-safe in-memory `KvStore` and the `KvService` facade over them, and a
-server skeleton that accepts TCP connections. The server does not speak a
-client protocol yet (Day 3). See
+Day 3 of 25: a single-node server that speaks RESP2, so `redis-cli` and Redis
+client libraries can talk to it. It supports `PING`, `ECHO`, `GET`, `SET`,
+`DEL` and `COMMAND`, with pipelining and in-order replies. Writes go through the
+`Replicator` interface (today a single-node `LocalReplicator`) into a
+thread-safe in-memory `KvStore`. Data is not yet persisted (Day 5). See
 [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the reasoning behind it.
 
 ## Roadmap
 
 - [x] Build system, CI with sanitizers, core types, replication interface
 - [x] Thread-safe in-memory KV state machine (`KvStore`) and `KvService`
-- [ ] Text protocol (`SET` / `GET` / `DEL`)
-- [ ] Command-line client
+- [x] RESP2 network layer (`PING` / `ECHO` / `GET` / `SET` / `DEL`), redis-cli compatible
+- [x] Command-line client (`distkv-cli`)
+- [ ] Multi-threaded I/O
 - [ ] Write-ahead log and crash recovery
 - [ ] Leader-follower replication (`LeaderReplicator`)
 - [ ] Failure and partition tests
@@ -51,13 +52,49 @@ warnings, as CI does. Binaries land in `build/<preset>/bin/`.
 ./build/debug/bin/distkv-server --id 1 --port 7000
 ```
 
+Talk to it with `redis-cli`:
+
 ```bash
-nc 127.0.0.1 7000
+redis-cli -p 7000 set k v
 ```
 
-The server replies with a banner and closes the connection. Stop it with
-Ctrl+C (or `SIGTERM`); it stops accepting and exits cleanly. Run with `--help`
-for all options.
+```bash
+redis-cli -p 7000 get k
+```
+
+Or with the bundled `distkv-cli`, which prints replies the same way and runs a
+REPL when given no command:
+
+```bash
+./build/debug/bin/distkv-cli -p 7000 set k v
+```
+
+```bash
+./build/debug/bin/distkv-cli -p 7000
+```
+
+```
+127.0.0.1:7000> get k
+"v"
+127.0.0.1:7000> del k
+(integer) 1
+127.0.0.1:7000> get k
+(nil)
+```
+
+Inline commands work too, for quick checks with `nc` (pipelined commands get
+replies in order):
+
+```bash
+printf 'PING\r\nSET a b\r\nGET a\r\n' | nc 127.0.0.1 7000
+```
+
+Stop the server with Ctrl+C (or `SIGTERM`): it stops accepting, closes client
+connections and exits cleanly. Run either binary with `--help` for all options.
+
+On macOS, the AirPlay Receiver listens on port 7000. If the server reports
+that the port is already in use, pass another port (`--port 7001`, and
+`-p 7001` for the clients) or turn off AirPlay Receiver in System Settings.
 
 ## Layout
 
@@ -67,6 +104,9 @@ docs/DESIGN.md    Design note
 src/common/       Command, LogEntry, Status, StatusOr
 src/storage/      StateMachine interface, KvStore
 src/replication/  Replicator interface, LocalReplicator
-src/server/       KvService and the distkv-server entry point
-tests/            GoogleTest suites
+src/protocol/     RESP2 request parser and reply encoder
+src/network/      Session (one per connection) and Server (acceptor)
+src/server/       KvService, CommandDispatcher and the distkv-server entry point
+tools/            distkv-cli
+tests/            GoogleTest suites, including end-to-end TCP tests
 ```
