@@ -3,6 +3,7 @@
 add_library(distkv_core STATIC
     protocol/resp.cpp
     replication/local_replicator.cpp
+    server/command_dispatcher.cpp
     server/kv_service.cpp
     storage/kv_store.cpp)
 target_include_directories(distkv_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
