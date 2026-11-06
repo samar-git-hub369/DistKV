@@ -35,6 +35,12 @@ namespace distkv {
 //
 // Owned by shared_ptr: every outstanding async operation and reply callback
 // holds a reference, so the session lives until the last one finishes.
+//
+// Thread safety: every member below is touched only on executor_, a strand,
+// so the io_context may run on any number of threads. start() and close()
+// only post to that strand and may be called from any thread. executor_,
+// dispatcher_ and limits_ are immutable after construction, which is what
+// lets reply callbacks on other threads read executor_ to post back.
 class Session : public std::enable_shared_from_this<Session> {
 public:
     struct Limits {
@@ -72,6 +78,9 @@ private:
     [[nodiscard]] bool over_limits() const;
     [[nodiscard]] bool finished() const;
 
+    // Copied from the socket at construction and never changed, so it is
+    // safe to read from any thread (unlike calling socket_.get_executor()).
+    const asio::any_io_executor executor_;
     asio::ip::tcp::socket socket_;
     CommandDispatcher& dispatcher_;
     const Limits limits_;

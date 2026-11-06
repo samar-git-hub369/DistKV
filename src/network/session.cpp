@@ -9,17 +9,18 @@
 namespace distkv {
 
 Session::Session(asio::ip::tcp::socket socket, CommandDispatcher& dispatcher, Limits limits)
-    : socket_(std::move(socket)),
+    : executor_(socket.get_executor()),
+      socket_(std::move(socket)),
       dispatcher_(dispatcher),
       limits_(limits),
       read_buffer_(limits.read_chunk_bytes) {}
 
 void Session::start() {
-    asio::dispatch(socket_.get_executor(), [self = shared_from_this()] { self->do_read(); });
+    asio::dispatch(executor_, [self = shared_from_this()] { self->do_read(); });
 }
 
 void Session::close() {
-    asio::post(socket_.get_executor(), [self = shared_from_this()] { self->do_close(); });
+    asio::post(executor_, [self = shared_from_this()] { self->do_close(); });
 }
 
 bool Session::over_limits() const {
@@ -94,7 +95,7 @@ void Session::process_input() {
         // returns; it only posts back to the session's strand.
         dispatcher_.dispatch(std::move(frame.args),
                              [self = shared_from_this(), seq](std::string reply) {
-                                 asio::post(self->socket_.get_executor(),
+                                 asio::post(self->executor_,
                                             [self, seq, reply = std::move(reply)]() mutable {
                                                 self->on_reply(seq, std::move(reply));
                                             });
