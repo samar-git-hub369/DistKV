@@ -7,9 +7,11 @@ a single node to Raft consensus.
 
 ## Status
 
-Day 3 of 25: a single-node server that speaks RESP2, so `redis-cli` and Redis
+Day 4 of 25: a single-node server that speaks RESP2, so `redis-cli` and Redis
 client libraries can talk to it. It supports `PING`, `ECHO`, `GET`, `SET`,
-`DEL` and `COMMAND`, with pipelining and in-order replies. Writes go through the
+`DEL` and `COMMAND`, with pipelining and in-order replies, and serves
+connections from a pool of I/O threads with a Redis-style connection limit.
+Writes go through the
 `Replicator` interface (today a single-node `LocalReplicator`) into a
 thread-safe in-memory `KvStore`. Data is not yet persisted (Day 5). See
 [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the reasoning behind it.
@@ -20,7 +22,7 @@ thread-safe in-memory `KvStore`. Data is not yet persisted (Day 5). See
 - [x] Thread-safe in-memory KV state machine (`KvStore`) and `KvService`
 - [x] RESP2 network layer (`PING` / `ECHO` / `GET` / `SET` / `DEL`), redis-cli compatible
 - [x] Command-line client (`distkv-cli`)
-- [ ] Multi-threaded I/O
+- [x] Multi-threaded I/O with a connection limit
 - [ ] Write-ahead log and crash recovery
 - [ ] Leader-follower replication (`LeaderReplicator`)
 - [ ] Failure and partition tests
@@ -89,8 +91,28 @@ replies in order):
 printf 'PING\r\nSET a b\r\nGET a\r\n' | nc 127.0.0.1 7000
 ```
 
+The server runs its I/O on one thread per hardware thread by default. Choose
+the number with `--threads` (1-256), and cap concurrent clients with
+`--max-connections` (default 10000; a client beyond the cap gets
+`-ERR max number of clients reached`, as with Redis):
+
+```bash
+./build/debug/bin/distkv-server --port 7000 --threads 4 --max-connections 1000
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--id N` | 1 | Node id |
+| `--port P` | 7000 | TCP port |
+| `--threads N` | hardware threads | I/O threads, 1-256 |
+| `--max-connections N` | 10000 | Maximum connected clients |
+
+The OS file-descriptor limit (`ulimit -n`) may allow fewer connections than
+`--max-connections`; raise it for large client counts.
+
 Stop the server with Ctrl+C (or `SIGTERM`): it stops accepting, closes client
-connections and exits cleanly. Run either binary with `--help` for all options.
+connections, joins its I/O threads and exits cleanly. Run either binary with
+`--help` for all options.
 
 On macOS, the AirPlay Receiver listens on port 7000. If the server reports
 that the port is already in use, pass another port (`--port 7001`, and
