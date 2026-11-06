@@ -7,15 +7,18 @@ a single node to Raft consensus.
 
 ## Status
 
-Day 1 of 25: the build system, core types (`Command`, `LogEntry`, `Status`),
-the `Replicator` interface with a single-node `LocalReplicator`, and a server
-skeleton that accepts TCP connections. There are no KV commands yet. See
+Day 2 of 25: the build system, core types (`Command`, `LogEntry`, `Status`,
+`StatusOr`), the `Replicator` interface with a single-node `LocalReplicator`,
+a thread-safe in-memory `KvStore` and the `KvService` facade over them, and a
+server skeleton that accepts TCP connections. The server does not speak a
+client protocol yet (Day 3). See
 [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the reasoning behind it.
 
 ## Roadmap
 
 - [x] Build system, CI with sanitizers, core types, replication interface
-- [ ] In-memory KV state machine and text protocol (`SET` / `GET` / `DEL`)
+- [x] Thread-safe in-memory KV state machine (`KvStore`) and `KvService`
+- [ ] Text protocol (`SET` / `GET` / `DEL`)
 - [ ] Command-line client
 - [ ] Write-ahead log and crash recovery
 - [ ] Leader-follower replication (`LeaderReplicator`)
@@ -61,9 +64,9 @@ for all options.
 ```
 cmake/            Warnings, sanitizers and dependency setup
 docs/DESIGN.md    Design note
-src/common/       Command, LogEntry, Status
-src/storage/      StateMachine interface
+src/common/       Command, LogEntry, Status, StatusOr
+src/storage/      StateMachine interface, KvStore
 src/replication/  Replicator interface, LocalReplicator
-src/server/       distkv-server entry point
+src/server/       KvService and the distkv-server entry point
 tests/            GoogleTest suites
 ```
