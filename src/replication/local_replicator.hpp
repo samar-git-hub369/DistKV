@@ -12,6 +12,12 @@ namespace distkv {
 // Single-node Replicator: no peers, so every proposal commits immediately.
 // It is always the leader and stays in term 1. Useful as the Day 1 backend
 // and as a reference implementation of the Replicator contract in tests.
+//
+// Thread safety: propose() may be called from any number of threads.
+// last_index_ and the apply() call are guarded by mutex_; commit_index_ is an
+// atomic; state_machine_ is a reference fixed at construction. Lock order:
+// mutex_ is held while apply() takes KvStore::mutex_, never the reverse. The
+// commit callback runs after mutex_ is released, on the proposing thread.
 class LocalReplicator final : public Replicator {
 public:
     static constexpr std::uint64_t kTerm = 1;

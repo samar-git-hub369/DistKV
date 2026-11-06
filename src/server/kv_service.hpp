@@ -14,8 +14,10 @@ namespace distkv {
 // any wire protocol. Writes go through the Replicator so they are ordered and
 // replicated; reads go straight to the local KvStore.
 //
-// Thread safety: as thread-safe as the Replicator and KvStore it wraps (both
-// are safe for concurrent use), so one instance may serve all connections.
+// Thread safety: immutable after construction (two references), so one
+// instance may serve all connections concurrently. Synchronisation lives in
+// what it wraps: the Replicator (LocalReplicator::mutex_) and the KvStore
+// (KvStore::mutex_).
 class KvService {
 public:
     // Both references must outlive this object. The store is held const: all

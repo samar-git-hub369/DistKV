@@ -23,10 +23,13 @@ using ReplyCallback = std::function<void(std::string reply)>;
 //   DEL key [key ...]     integer: number of keys removed (see below)
 //   COMMAND [...]         empty array (keeps redis-cli's startup probe quiet)
 //
-// Thread safety: dispatch() may be called concurrently. The reply callback is
-// invoked exactly once per dispatch(), either before dispatch() returns or
-// later from whatever thread the Replicator completes on, so the caller must
-// not assume which thread it runs on.
+// Thread safety: immutable after construction (it holds only service_), so
+// dispatch() may be called concurrently from any number of sessions. State
+// shared by one DEL's per-key callbacks lives in a heap object guarded by its
+// own mutex (see del()). The reply callback is invoked exactly once per
+// dispatch(), either before dispatch() returns or later from whatever thread
+// the Replicator completes on, so the caller must not assume which thread it
+// runs on. It is never invoked while a lock is held.
 class CommandDispatcher {
 public:
     // `service` must outlive this object.

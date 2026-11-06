@@ -151,12 +151,15 @@ void CommandDispatcher::del(std::vector<std::string> args, ReplyCallback reply) 
     seen.clear();  // Holds views into args, which are moved from below.
 
     // Shared by the per-key callbacks, which may run on other threads.
+    // remaining and first_error are guarded by mutex; existed and reply are
+    // set before any callback can run and only read afterwards (reply by the
+    // last callback, once no other callback can touch this object).
     struct Pending {
         std::mutex mutex;
-        std::size_t remaining;
-        std::optional<Status> first_error;
-        std::int64_t existed;
-        ReplyCallback reply;
+        std::size_t remaining;               // Guarded by mutex.
+        std::optional<Status> first_error;   // Guarded by mutex.
+        std::int64_t existed;                // Immutable once shared.
+        ReplyCallback reply;                 // Immutable once shared.
     };
     auto pending = std::make_shared<Pending>();
     pending->remaining = args.size() - 1;

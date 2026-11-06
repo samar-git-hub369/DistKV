@@ -18,9 +18,12 @@ namespace distkv {
 // applied to. Keys and values are arbitrary byte strings (embedded '\0' and
 // non-UTF-8 bytes are fine).
 //
-// Thread safety: all methods are safe to call concurrently. apply() is only
-// ever called by the Replicator, one entry at a time; get(), size() and
+// Thread safety: all methods are safe to call concurrently. map_ and
+// last_applied_ are guarded by mutex_ (exclusive for apply(), shared for the
+// readers). apply() is only ever called by the Replicator, one entry at a time
+// and with LocalReplicator::mutex_ held; get(), size() and
 // last_applied_index() may be called from any number of threads at once.
+// mutex_ is the innermost lock: nothing is called while holding it.
 class KvStore final : public StateMachine {
 public:
     KvStore() = default;
