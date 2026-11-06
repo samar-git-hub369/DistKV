@@ -1,6 +1,8 @@
 # distkv_core: everything except the server entry point, so tests and tools
 # can link the real code.
 add_library(distkv_core STATIC
+    network/server.cpp
+    network/session.cpp
     protocol/resp.cpp
     replication/local_replicator.cpp
     server/command_dispatcher.cpp
@@ -8,6 +10,7 @@ add_library(distkv_core STATIC
     storage/kv_store.cpp)
 target_include_directories(distkv_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(distkv_core PUBLIC cxx_std_20)
+target_link_libraries(distkv_core PUBLIC asio::asio)
 distkv_set_warnings(distkv_core)
 
 add_executable(distkv-server server/main.cpp)
