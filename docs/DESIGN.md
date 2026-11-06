@@ -130,12 +130,64 @@ DistKV speaks RESP2, the Redis protocol, so existing tools work unchanged.
   pending or 4 MiB of output is queued, and resumes as the backlog drains. A
   client that pipelines without reading cannot grow server memory without
   bound; TCP flow control pushes back on it instead.
+- **Connection limit.** At most `--max-connections` (default 10000) clients
+  are connected at once. Like Redis, a client accepted beyond that gets
+  `-ERR max number of clients reached` and is closed; existing clients are
+  unaffected. A slot is taken when a session is created and released when its
+  connection closes, through a counter shared with the sessions (an atomic,
+  because slots are released on session strands while the acceptor takes them
+  on its own). The OS file-descriptor limit (`ulimit -n`) may be the tighter
+  bound; if `accept()` runs out of descriptors the acceptor backs off for
+  100 ms instead of spinning.
 - **Known limitation: DEL's count.** `DEL k1 k2 ...` proposes one delete per key
   and replies with how many of the distinct keys existed when checked just
   before proposing. Under concurrent writers the count can be off (another
   client may create or delete a key between the check and the apply). It will
   be exact once the state machine reports apply results back through the
   commit callback.
+
+## Threading model
+
+`distkv-server --threads N` runs `io_context::run()` on N threads (the main
+thread is one of them; the default is the number of hardware threads). Nothing
+is pinned to a thread; what keeps state consistent is the executor or lock each
+piece of code runs under:
+
+| Code | Runs on | Protects |
+| --- | --- | --- |
+| `Server` accept loop, `stop()`'s body | the server's strand | the acceptor and its retry timer |
+| `Session` handlers (read, parse, dispatch, reply, write, close) | that session's strand, one per connection | all session state |
+| `CommandDispatcher`, `KvService` | the calling session's strand | nothing to protect: immutable after construction |
+| `LocalReplicator::propose()` | the caller's thread | `last_index_` and `apply()` under `LocalReplicator::mutex_` |
+| `KvStore` | the caller's thread | `map_`, `last_applied_` under `KvStore::mutex_` (shared for reads) |
+| Commit callbacks | the replicator's completing thread | they only post to a session strand (or lock a per-request mutex, for DEL) |
+
+Any number of sessions run in parallel on different threads; one session never
+runs on two threads at once. Other shared objects are protected as follows:
+`Server::sessions_` and `stopped_` by `Server::sessions_mutex_`; the open
+connection count by an atomic; `LocalReplicator::commit_index_` by an atomic;
+a DEL's per-key completion state by a mutex in a heap object shared by its
+callbacks. Each class's header states the same.
+
+**Lock hierarchy.** `LocalReplicator::mutex_` -> `KvStore::mutex_`: the
+replicator applies entries while holding its mutex, so the store's lock is
+always taken second and is the innermost lock; nothing is called while holding
+it. `Server::sessions_mutex_` is a leaf: the server copies what it needs under
+it and releases it before calling into a `Session` or the dispatcher.
+
+**No calls under locks.** Commit callbacks, reply callbacks and dispatcher
+calls are never made while holding a lock. A callback may therefore re-enter
+`propose()` or post to a strand without risk of deadlock, and a slow callback
+never blocks other threads.
+
+**Shutdown.** `Server::stop()` may be called from any thread and more than
+once: it posts to the server's strand, which closes the acceptor and posts a
+close to every live session. Once their handlers finish (and the signal set is
+cancelled or has fired) the io_context runs out of work, every thread's
+`run()` returns and `main` joins them. An exception that escapes a handler
+unwinds out of `run()` on that thread only; `main` logs it with the thread's
+index, starts the same shutdown, re-enters `run()` to help drain it, and exits
+non-zero after joining every thread rather than calling `std::terminate`.
 
 ## Consistency model
 
