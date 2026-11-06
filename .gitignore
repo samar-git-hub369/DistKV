@@ -1,0 +1,18 @@
+# Build output
+/build/
+/out/
+/cmake-build-*/
+
+# CMake user-local presets
+CMakeUserPresets.json
+
+# Tooling
+compile_commands.json
+.cache/
+.clangd
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
