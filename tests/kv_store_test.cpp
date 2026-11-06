@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <latch>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -168,13 +169,18 @@ TEST(KvStoreConcurrencyTest, ConcurrentWritersAndReaders) {
     std::atomic<int> failed_proposals{0};
     std::atomic<long> reads{0};
 
+    // Writers start only after every reader has done one read, so reads > 0
+    // holds even if the writers would otherwise finish before any reader is
+    // scheduled.
+    std::latch readers_started(kReaders);
+
     std::vector<std::thread> readers;
     readers.reserve(kReaders);
     for (int r = 0; r < kReaders; ++r) {
         readers.emplace_back([&, r] {
             long local_reads = 0;
             int k = r;
-            while (!writers_done.load(std::memory_order_acquire)) {
+            const auto read_once = [&] {
                 const int writer = k % kWriters;
                 const int key = k % kKeysPerWriter;
                 const std::string expected_prefix = key_for(writer, key) + "-r";
@@ -186,10 +192,14 @@ TEST(KvStoreConcurrencyTest, ConcurrentWritersAndReaders) {
                 (void)store.last_applied_index();
                 ++local_reads;
                 ++k;
-            }
+            };
+            read_once();
+            readers_started.count_down();
+            while (!writers_done.load(std::memory_order_acquire)) read_once();
             reads.fetch_add(local_reads);
         });
     }
+    readers_started.wait();
 
     std::vector<std::thread> writers;
     writers.reserve(kWriters);
