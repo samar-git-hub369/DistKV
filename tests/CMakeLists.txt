@@ -22,3 +22,5 @@ distkv_add_test(kv_service_test kv_service_test.cpp)
 distkv_add_test(resp_test resp_test.cpp)
 
 distkv_add_test(command_dispatcher_test command_dispatcher_test.cpp)
+
+distkv_add_test(server_integration_test server_integration_test.cpp)
