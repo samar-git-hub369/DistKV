@@ -95,7 +95,7 @@ class ServerConcurrencyTest : public ::testing::Test {
 protected:
     KvStore store_;
     ThreadRecordingReplicator replicator_{store_};
-    Harness harness_{replicator_, store_, {.threads = kIoThreads}};
+    Harness harness_{replicator_, store_, test::with_threads(kIoThreads)};
 };
 
 // Runs body(i) on `n` threads that start together, and joins them.
@@ -311,7 +311,9 @@ TEST_F(ServerConcurrencyTest, HandlersRunOnMoreThanOneThread) {
 TEST(ServerConnectionLimitTest, ExtraClientIsRejectedAndSlotsAreReleased) {
     KvStore store;
     LocalReplicator replicator(store);
-    Harness harness(replicator, store, {.threads = kIoThreads, .max_connections = 2});
+    HarnessOptions options = test::with_threads(kIoThreads);
+    options.max_connections = 2;
+    Harness harness(replicator, store, options);
     Server& server = harness.server();
 
     auto first = std::make_unique<Client>(harness.port());

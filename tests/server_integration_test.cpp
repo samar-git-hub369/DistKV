@@ -34,11 +34,13 @@ class ServerIntegrationTest : public ::testing::TestWithParam<int> {
 protected:
     KvStore store_;
     LocalReplicator replicator_{store_};
-    Harness harness_{replicator_, store_, {.threads = GetParam()}};
+    Harness harness_{replicator_, store_, test::with_threads(GetParam())};
 };
 
 INSTANTIATE_TEST_SUITE_P(IoThreads, ServerIntegrationTest, ::testing::Values(1, 4),
-                         [](const auto& info) { return std::to_string(info.param) + "Threads"; });
+                         [](const auto& param_info) {
+                             return std::to_string(param_info.param) + "Threads";
+                         });
 
 TEST_P(ServerIntegrationTest, SetGetDelRoundTrip) {
     Client client(harness_.port());

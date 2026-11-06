@@ -156,6 +156,14 @@ struct HarnessOptions {
     std::size_t max_connections = Server::kDefaultMaxConnections;
 };
 
+// Options with only the io thread count changed. (Designated initializers
+// that skip members trip GCC's -Wmissing-field-initializers.)
+inline HarnessOptions with_threads(int threads) {
+    HarnessOptions options;
+    options.threads = threads;
+    return options;
+}
+
 // A Server and the io threads running its io_context.
 class Harness {
 public:
