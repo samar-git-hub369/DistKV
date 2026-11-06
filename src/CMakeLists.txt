@@ -1,8 +1,10 @@
 # distkv_core: everything except the server entry point, so tests and tools
 # can link the real code.
-add_library(distkv_core INTERFACE)
-target_include_directories(distkv_core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_compile_features(distkv_core INTERFACE cxx_std_20)
+add_library(distkv_core STATIC
+    replication/local_replicator.cpp)
+target_include_directories(distkv_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(distkv_core PUBLIC cxx_std_20)
+distkv_set_warnings(distkv_core)
 
 add_executable(distkv-server server/main.cpp)
 target_link_libraries(distkv-server PRIVATE distkv_core)
