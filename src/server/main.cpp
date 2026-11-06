@@ -1,7 +1,7 @@
-// distkv-server: parses flags, builds the single-node stack (KvStore behind a
-// LocalReplicator, fronted by KvService), listens on a TCP port, greets each
-// connection with a banner and closes it, and shuts down gracefully on
-// SIGINT/SIGTERM. The request protocol arrives on Day 3.
+// distkv-server: parses flags, builds the single-node stack
+//   KvStore -> LocalReplicator -> KvService -> CommandDispatcher -> Server
+// and serves RESP2 on a TCP port until SIGINT/SIGTERM, then shuts down
+// gracefully: stop accepting, close sessions, let io_context drain.
 
 #include <asio.hpp>
 #include <charconv>
@@ -10,15 +10,14 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
-#include <memory>
 #include <optional>
-#include <string>
 #include <string_view>
 #include <system_error>
-#include <utility>
 #include <variant>
 
+#include "network/server.hpp"
 #include "replication/local_replicator.hpp"
+#include "server/command_dispatcher.hpp"
 #include "server/kv_service.hpp"
 #include "storage/kv_store.hpp"
 
@@ -100,71 +99,6 @@ std::variant<Options, int> parse_args(int argc, char** argv) {
     return options;
 }
 
-class Server {
-public:
-    Server(asio::io_context& io, const Options& options)
-        : acceptor_(io),
-          banner_(std::make_shared<const std::string>(std::string(kProgram) + ' ' +
-                                                      std::string(kVersion) + " node " +
-                                                      std::to_string(options.id) + "\r\n")) {}
-
-    // Opens the listening socket. Returns an error instead of throwing so
-    // main() can print a precise message.
-    std::error_code listen(std::uint16_t port) {
-        const asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
-        asio::error_code ec;
-        acceptor_.open(endpoint.protocol(), ec);
-        if (!ec) acceptor_.set_option(asio::socket_base::reuse_address(true), ec);
-        if (!ec) acceptor_.bind(endpoint, ec);
-        if (!ec) acceptor_.listen(asio::socket_base::max_listen_connections, ec);
-        if (ec) {
-            asio::error_code ignored;
-            acceptor_.close(ignored);
-        }
-        return ec;
-    }
-
-    void start() { accept_next(); }
-
-    // Stops accepting. Connections already in flight finish their banner,
-    // after which io_context::run() returns because no work is left.
-    void stop() {
-        asio::error_code ignored;
-        acceptor_.close(ignored);
-    }
-
-private:
-    void accept_next() {
-        acceptor_.async_accept([this](const asio::error_code& ec, asio::ip::tcp::socket socket) {
-            if (ec == asio::error::operation_aborted) {
-                return;  // Acceptor closed: shutting down.
-            }
-            if (ec) {
-                std::cerr << kProgram << ": accept failed: " << ec.message() << '\n';
-            } else {
-                greet(std::move(socket));
-            }
-            if (acceptor_.is_open()) {
-                accept_next();
-            }
-        });
-    }
-
-    void greet(asio::ip::tcp::socket socket) {
-        auto conn = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-        auto banner = banner_;
-        asio::async_write(*conn, asio::buffer(*banner),
-                          [conn, banner](const asio::error_code& /*ec*/, std::size_t /*n*/) {
-                              asio::error_code ignored;
-                              conn->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
-                              conn->close(ignored);
-                          });
-    }
-
-    asio::ip::tcp::acceptor acceptor_;
-    std::shared_ptr<const std::string> banner_;
-};
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -176,12 +110,12 @@ int main(int argc, char** argv) {
 
     distkv::KvStore store;
     distkv::LocalReplicator replicator(store);
-    // Not used yet: the network layer will dispatch client requests to it on Day 3.
-    [[maybe_unused]] distkv::KvService service(replicator, store);
+    distkv::KvService service(replicator, store);
+    distkv::CommandDispatcher dispatcher(service);
 
     try {
         asio::io_context io;
-        Server server(io, options);
+        distkv::Server server(io, dispatcher);
 
         if (const std::error_code ec = server.listen(options.port)) {
             if (ec == asio::error::address_in_use) {
