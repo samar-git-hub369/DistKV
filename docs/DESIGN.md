@@ -25,29 +25,34 @@ to one page on purpose and updated as the design changes.
 ## Architecture
 
 ```
-                +------------------------ distkv-server -------------------------+
-                |                                                                |
- client --TCP-->| Network (Asio) --> Request handler ---propose()---> Replicator  |<--> peers
-                |                     |        ^                        |        |   (Day 8+)
-                |                     |        +---commit callback------+        |
-                |               reads |                                 | apply(entry),
-                |                     v                                 | in index order
-                |              StateMachine (KV) <----------------------+        |
-                +----------------------------------------------------------------+
+ client --RESP/TCP--> Server / Session     src/network: framing, reply ordering, backpressure
+                            | args
+                            v
+                     CommandDispatcher     src/server: Redis commands -> KvService calls
+                            |
+                            v
+                        KvService ---propose()---> Replicator <----> peers (Day 8+)
+                         |      ^                    |
+                   reads |      +--commit callback---+ apply(entry), in index order
+                         v                           |
+                      KvStore (StateMachine) <-------+
 ```
 
 ## Life of a write
 
-1. A client sends `SET k v` to the leader.
-2. The request handler builds a `Command` and calls `Replicator::propose()`.
+1. A client sends `SET k v` (a RESP array) to the leader.
+2. Its `Session` parses the frame and reserves a reply slot; the
+   `CommandDispatcher` calls `KvService::set()`, which builds a `Command` and
+   calls `Replicator::propose()`.
 3. The replicator assigns the next log index under the current term, producing
    a `LogEntry{index, term, command}`.
 4. The entry is replicated (Day 1: nothing to do; Day 8: followers; Phase 2: a
    majority acknowledges it) and becomes committed.
 5. Committed entries are applied to the `StateMachine` strictly in index order.
-6. The commit callback fires with `Status::ok()` and the index; the handler
-   replies to the client. On failure (`kNotLeader`, `kUnavailable`, ...) the
-   client is told why and where to retry.
+6. The commit callback fires with `Status::ok()` and the index; the encoded
+   `+OK` is posted back to the session's strand, fills its slot and is written
+   once every earlier reply has been. On failure (`kNotLeader`,
+   `kUnavailable`, ...) the client gets a RESP error saying why.
 
 ## Key abstractions
 
@@ -60,6 +65,8 @@ to one page on purpose and updated as the design changes.
 | `StateMachine` | Deterministic target of committed entries, applied one at a time, in order. |
 | `KvStore` | The `StateMachine`: an in-memory, binary-safe `string -> string` map. |
 | `KvService` | Protocol-independent facade: `set`/`del` go through `propose()`, `get` reads the store (leader only). |
+| `CommandDispatcher` | Redis commands (`GET`, `SET`, `DEL`, ...) on top of `KvService`; no sockets. |
+| `Session` / `Server` | One RESP connection with ordered, batched replies and backpressure / the acceptor that owns sessions. |
 | `Replicator` | `propose(Command, CommitCallback)`, `is_leader()`, `commit_index()`, `current_term()`. Implemented by `LocalReplicator` (Day 1), `LeaderReplicator` (Day 8) and `RaftReplicator` (Phase 2). |
 
 ## Decisions
@@ -89,6 +96,46 @@ to one page on purpose and updated as the design changes.
   normal outcomes in a distributed system.
 - **Standalone Asio** for networking: mature, header-only, and no Boost.
 - **Dependencies pinned** via FetchContent tags for reproducible builds.
+
+## Protocol
+
+DistKV speaks RESP2, the Redis protocol, so existing tools work unchanged.
+
+- **Framing.** Requests are arrays of bulk strings
+  (`*2\r\n$3\r\nGET\r\n$1\r\nk\r\n`), as every Redis client sends, or inline
+  commands (`GET k\r\n`) for nc/telnet. The parser is incremental and
+  stateless: given a buffer it reports a complete frame plus bytes consumed,
+  "incomplete", or a protocol error, and never reads past the buffer. Bulk
+  payloads are binary-safe because the length prefix is trusted, so values may
+  contain `\r\n` and `\0`.
+- **Limits.** 1 MiB per bulk string, 1024 arguments per request, 64 KiB per
+  inline line and 8 MiB per request in total. Exceeding one, a bad type byte, a
+  negative or non-numeric length, or a missing CRLF after a bulk is a protocol
+  error: the server replies `-ERR Protocol error: <msg>` after any earlier
+  replies and closes the connection. The limits also bound how much a
+  half-sent request can make the server buffer.
+- **Reply ordering.** Clients may pipeline. Each request gets a slot in a
+  per-session FIFO when it is dispatched; a reply fills its slot and filled
+  slots are written strictly from the front. A later request whose commit
+  completes first therefore waits for the earlier ones. Commit callbacks may
+  arrive on any thread (a networked replicator completes on its own threads),
+  so they only post the reply back to the session's strand; all session state
+  is touched on that strand. At most one write is in flight per session, and
+  replies that complete meanwhile are batched into the next one.
+- **Errors.** `Status` codes map to RESP errors: `kInvalidArgument` ->
+  `-ERR <msg>`, `kNotLeader` -> `-NOTLEADER <msg>`, `kUnavailable` ->
+  `-TRYAGAIN <msg>`, `kInternal` -> `-ERR internal: <msg>`. Wrong arity and
+  unknown commands use Redis's own wording.
+- **Backpressure.** A session stops parsing and reading while 1024 replies are
+  pending or 4 MiB of output is queued, and resumes as the backlog drains. A
+  client that pipelines without reading cannot grow server memory without
+  bound; TCP flow control pushes back on it instead.
+- **Known limitation: DEL's count.** `DEL k1 k2 ...` proposes one delete per key
+  and replies with how many of the distinct keys existed when checked just
+  before proposing. Under concurrent writers the count can be off (another
+  client may create or delete a key between the check and the apply). It will
+  be exact once the state machine reports apply results back through the
+  commit callback.
 
 ## Consistency model
 
