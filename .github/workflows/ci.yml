@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            cc: gcc
+            cxx: g++
+            preset: debug
+          - name: clang
+            cc: clang
+            cxx: clang++
+            preset: debug
+          - name: gcc + address
+            cc: gcc
+            cxx: g++
+            preset: asan
+          - name: gcc + thread
+            cc: gcc
+            cxx: g++
+            preset: tsan
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recent Ubuntu kernels use more ASLR entropy than TSan supports.
+      - name: Reduce ASLR entropy for TSan
+        if: matrix.preset == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ${CXX} --version
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DDISTKV_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -j "$(nproc)"
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
