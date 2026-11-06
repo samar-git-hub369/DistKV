@@ -9,3 +9,6 @@ function(distkv_add_test name)
 endfunction()
 
 distkv_add_test(common_test common_test.cpp)
+
+distkv_add_test(asio_smoke_test asio_smoke_test.cpp)
+target_link_libraries(asio_smoke_test PRIVATE asio::asio)
