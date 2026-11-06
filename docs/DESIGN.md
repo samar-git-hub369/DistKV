@@ -56,7 +56,10 @@ to one page on purpose and updated as the design changes.
 | `Command` | A mutation (`kSet`, `kDelete`) on one key. Reads are not commands. |
 | `LogEntry` | `{index, term, command}`: a slot in the replicated log. |
 | `Status` | Error code + message returned by value; no exceptions across layers. |
+| `StatusOr<T>` | A value or a non-OK `Status`, for operations that return a result. |
 | `StateMachine` | Deterministic target of committed entries, applied one at a time, in order. |
+| `KvStore` | The `StateMachine`: an in-memory, binary-safe `string -> string` map. |
+| `KvService` | Protocol-independent facade: `set`/`del` go through `propose()`, `get` reads the store (leader only). |
 | `Replicator` | `propose(Command, CommitCallback)`, `is_leader()`, `commit_index()`, `current_term()`. Implemented by `LocalReplicator` (Day 1), `LeaderReplicator` (Day 8) and `RaftReplicator` (Phase 2). |
 
 ## Decisions
@@ -69,6 +72,19 @@ to one page on purpose and updated as the design changes.
   they may re-enter `propose()`.
 - **Validate before assigning an index**, so rejected commands never leave
   holes in the log.
+- **`KvStore` uses a `std::shared_mutex`.** Reads dominate a KV workload and
+  can run in parallel under a shared lock. Writes take an exclusive lock, but
+  they are already serialised by the Replicator (one `apply()` at a time), so
+  finer-grained locking or sharding would buy nothing yet. Lookups use
+  transparent hashing so a `string_view` key is never copied into a `string`.
+- **Idempotent replay.** `KvStore::apply()` silently skips any entry whose
+  index is at or below `last_applied_index()`. Recovery (Day 5) can then
+  replay the write-ahead log from a snapshot or from the start, even if the
+  replayed range overlaps what is already applied, without double-applying.
+- **Abort on a gap.** An entry whose index is not `last_applied_index() + 1`
+  means an entry was lost or reordered upstream, which is a bug. Applying it
+  would silently diverge from other replicas, and `apply()` must not throw, so
+  the store logs the expected and actual index and calls `std::abort()`.
 - **Status values, not exceptions**, because "not leader" and "unavailable" are
   normal outcomes in a distributed system.
 - **Standalone Asio** for networking: mature, header-only, and no Boost.
@@ -79,8 +95,8 @@ to one page on purpose and updated as the design changes.
 - **Day 1 (`LocalReplicator`)**: one node, so trivially linearizable; no fault
   tolerance.
 - **Day 8 (`LeaderReplicator`)**: a statically configured leader streams its
-  log to followers. Reads from the leader are consistent, reads from followers
-  may be stale. **Known limitation: split brain.** There is no election and no
+  log to followers. Reads are served by the leader only (followers answer
+  `kNotLeader`), so a client never reads from a lagging follower. **Known limitation: split brain.** There is no election and no
   term-based fencing, so if an operator promotes a follower while the old
   leader is partitioned but alive, both accept writes and their logs diverge.
   Acknowledged writes can be lost when the partition heals. This is the
