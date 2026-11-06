@@ -1,6 +1,7 @@
-// distkv-server: Day 1 skeleton. Parses flags, listens on a TCP port, greets
-// each connection with a banner and closes it, and shuts down gracefully on
-// SIGINT/SIGTERM. The request protocol arrives in later days.
+// distkv-server: parses flags, builds the single-node stack (KvStore behind a
+// LocalReplicator, fronted by KvService), listens on a TCP port, greets each
+// connection with a banner and closes it, and shuts down gracefully on
+// SIGINT/SIGTERM. The request protocol arrives on Day 3.
 
 #include <asio.hpp>
 #include <charconv>
@@ -18,7 +19,8 @@
 #include <variant>
 
 #include "replication/local_replicator.hpp"
-#include "storage/state_machine.hpp"
+#include "server/kv_service.hpp"
+#include "storage/kv_store.hpp"
 
 namespace {
 
@@ -98,12 +100,6 @@ std::variant<Options, int> parse_args(int argc, char** argv) {
     return options;
 }
 
-// Placeholder until the key-value store lands; the replicator needs a target.
-class NullStateMachine final : public distkv::StateMachine {
-public:
-    void apply(const distkv::LogEntry& /*entry*/) override {}
-};
-
 class Server {
 public:
     Server(asio::io_context& io, const Options& options)
@@ -178,8 +174,10 @@ int main(int argc, char** argv) {
     }
     const Options options = std::get<Options>(parsed);
 
-    NullStateMachine state_machine;
-    distkv::LocalReplicator replicator(state_machine);
+    distkv::KvStore store;
+    distkv::LocalReplicator replicator(store);
+    // Not used yet: the network layer will dispatch client requests to it on Day 3.
+    [[maybe_unused]] distkv::KvService service(replicator, store);
 
     try {
         asio::io_context io;
