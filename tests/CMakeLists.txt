@@ -2,6 +2,7 @@ include(GoogleTest)
 
 add_executable(distkv_tests
     coding_test.cpp
+    memtable_test.cpp
     wal_test.cpp
 )
 
