@@ -23,7 +23,8 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] Project scaffold, CMake build, GoogleTest
 - [x] Write-ahead log with checksums and crash recovery
 - [x] MemTable with tombstones, flush threshold and WAL recovery
-- [ ] SSTable format
+- [x] SSTable format: writer, sparse index, checksummed point lookups
+- [ ] SSTable iteration and MemTable flush
 - [ ] Bloom filters and the storage engine read/write path
 - [ ] Background compaction
 - [ ] TCP server and text protocol
@@ -65,3 +66,23 @@ The MemTable is the in-memory write buffer: a sorted map from key to `{seq, tomb
 - **Sequence numbers.** Every write carries the sequence number it was logged with. A write that is not newer than what the table already holds is ignored, so replaying a WAL twice leaves the table unchanged.
 - **Flush threshold.** The table tracks key bytes, value bytes and a fixed per-entry overhead. `ShouldFlush()` turns true once that reaches the configured size.
 - **Recovery.** `RecoverMemTable` replays the WAL into a fresh table and trims a torn tail, restoring exactly the writes that were durably logged.
+
+## SSTables
+
+A full MemTable is written out as an SSTable: an immutable file of entries sorted by key.
+
+```
+data block 0 | data block 1 | ... | index block | footer (40 bytes)
+
+data block  := entry* crc32
+entry       := key_len:u32 key seq:u64 type:u8 value_len:u32 value
+index block := smallest_key handle* crc32
+handle      := last_key offset:u64 size:u32
+footer      := index_offset:u64 index_size:u32 entry_count:u64 max_seq:u64 crc32 magic:u64
+```
+
+- **Sparse index.** Entries are packed into blocks of about 4 KiB, and the index holds one handle per block (its last key and position), not one per key. The reader keeps the index in memory, binary-searches it for the one block that could contain a key, and reads only that block with a single `pread`.
+- **Checksums everywhere.** The footer, index and every data block end in a CRC-32. Opening a table verifies the footer and index; a damaged data block is reported as `Corruption` when a read touches it.
+- **Atomic publish.** The writer streams to `<name>.tmp`, syncs it, renames it into place and syncs the directory. A crash mid-flush leaves either no table or a complete one, never a partial file under the real name.
+- **Tombstones are kept.** A delete is written as a tombstone entry, so it keeps hiding older values in older tables until compaction removes both.
+- **Concurrency.** A reader is immutable after `Open`, and `pread` does not share a file offset, so any number of threads can look up keys in the same table at once.
