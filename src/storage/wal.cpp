@@ -5,67 +5,18 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string_view>
 
 #include "common/coding.h"
 #include "common/crc32.h"
+#include "common/file_util.h"
 
 namespace distkv {
 namespace {
 
 constexpr size_t kHeaderSize = 8;  // crc32 + length
-
-Status ErrnoStatus(const std::string& what, const std::string& path) {
-    return Status::IOError(what + " " + path + ": " + std::strerror(errno));
-}
-
-// fsync is not enough on macOS: it hands data to the drive but does not ask
-// the drive to flush its own cache. F_FULLFSYNC does.
-int DurableSync(int fd) {
-#ifdef __APPLE__
-    if (::fcntl(fd, F_FULLFSYNC) == 0) {
-        return 0;
-    }
-    // Some filesystems (e.g. network mounts) do not support F_FULLFSYNC.
-#endif
-    return ::fsync(fd);
-}
-
-// A new file's directory entry is only durable once the directory is synced.
-Status SyncParentDir(const std::string& path) {
-    std::filesystem::path parent = std::filesystem::path(path).parent_path();
-    if (parent.empty()) {
-        parent = ".";
-    }
-    const int dir_fd = ::open(parent.c_str(), O_RDONLY | O_CLOEXEC);
-    if (dir_fd < 0) {
-        return ErrnoStatus("open directory", parent.string());
-    }
-    const int rc = DurableSync(dir_fd);
-    ::close(dir_fd);
-    if (rc != 0) {
-        return ErrnoStatus("sync directory", parent.string());
-    }
-    return Status::Ok();
-}
-
-Status WriteAll(int fd, const char* data, size_t n) {
-    while (n > 0) {
-        const ssize_t written = ::write(fd, data, n);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return Status::IOError(std::string("write wal: ") + std::strerror(errno));
-        }
-        data += written;
-        n -= static_cast<size_t>(written);
-    }
-    return Status::Ok();
-}
 
 bool DecodePayload(std::string_view in, WalRecord* out) {
     if (in.size() < 1 + 8) {
@@ -127,7 +78,7 @@ Status WalWriter::Open(const std::string& path, WalSyncMode mode,
             return s;
         }
     }
-    out->reset(new WalWriter(fd, mode));
+    out->reset(new WalWriter(fd, mode, path));
     return Status::Ok();
 }
 
@@ -147,7 +98,7 @@ Status WalWriter::Append(const WalRecord& record) {
     }
 
     const std::string frame = EncodeWalFrame(record);
-    Status s = WriteAll(fd_, frame.data(), frame.size());
+    Status s = WriteAll(fd_, frame.data(), frame.size(), path_);
     if (!s.ok()) {
         return s;
     }
@@ -161,7 +112,7 @@ Status WalWriter::Append(const WalRecord& record) {
 
 Status WalWriter::Sync() {
     if (DurableSync(fd_) != 0) {
-        return Status::IOError(std::string("sync wal: ") + std::strerror(errno));
+        return ErrnoStatus("sync wal", path_);
     }
     return Status::Ok();
 }

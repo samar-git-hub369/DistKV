@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "common/status.h"
 
@@ -59,10 +60,12 @@ class WalWriter {
     uint64_t bytes_written() const { return bytes_written_; }
 
   private:
-    WalWriter(int fd, WalSyncMode mode) : fd_(fd), mode_(mode) {}
+    WalWriter(int fd, WalSyncMode mode, std::string path)
+        : fd_(fd), mode_(mode), path_(std::move(path)) {}
 
     int fd_;
     WalSyncMode mode_;
+    std::string path_;
     uint64_t bytes_written_ = 0;
 };
 
