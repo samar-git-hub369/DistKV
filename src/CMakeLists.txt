@@ -3,6 +3,7 @@ add_library(distkv_storage STATIC
     common/crc32.cpp
     common/file_util.cpp
     storage/memtable.cpp
+    storage/sstable.cpp
     storage/wal.cpp
 )
 

@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "storage/lookup.h"
 #include "storage/wal.h"
 
 // In-memory write buffer of the LSM tree.
@@ -20,12 +21,6 @@
 // SSTable may still hold a value for it, and the tombstone is what hides that
 // value from reads until compaction drops both.
 namespace distkv {
-
-enum class LookupResult {
-    kFound,       // live value returned
-    kDeleted,     // tombstone: the key is deleted, do not search older tables
-    kNotPresent,  // this table knows nothing about the key
-};
 
 struct MemTableEntry {
     uint64_t seq = 0;
