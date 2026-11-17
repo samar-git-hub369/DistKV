@@ -24,7 +24,7 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] Write-ahead log with checksums and crash recovery
 - [x] MemTable with tombstones, flush threshold and WAL recovery
 - [x] SSTable format: writer, sparse index, checksummed point lookups
-- [ ] SSTable iteration and MemTable flush
+- [x] SSTable iteration and MemTable flush
 - [ ] Bloom filters and the storage engine read/write path
 - [ ] Background compaction
 - [ ] TCP server and text protocol
@@ -86,3 +86,10 @@ footer      := index_offset:u64 index_size:u32 entry_count:u64 max_seq:u64 crc32
 - **Atomic publish.** The writer streams to `<name>.tmp`, syncs it, renames it into place and syncs the directory. A crash mid-flush leaves either no table or a complete one, never a partial file under the real name.
 - **Tombstones are kept.** A delete is written as a tombstone entry, so it keeps hiding older values in older tables until compaction removes both.
 - **Concurrency.** A reader is immutable after `Open`, and `pread` does not share a file offset, so any number of threads can look up keys in the same table at once.
+- **Iteration.** `SSTableIterator` walks a table in key order, tombstones included, holding one block in memory at a time. `Seek(target)` binary-searches the index for the first block that can hold a key `>= target`, then scans within it. Point lookups (`Get`) are a `Seek` plus a key comparison, and keys outside the table's smallest/largest range return without touching disk. Range scans and compaction (which merges several tables) build on the same iterator.
+
+## Flushing
+
+`FlushMemTable` writes a MemTable, tombstones included, to a new SSTable in one sequential pass and reports the highest sequence number it made durable. Because the SSTable is published atomically, a flush either fully succeeds or leaves nothing behind. Once it succeeds, WAL records up to that sequence number are no longer needed for recovery.
+
+The storage engine (next) will freeze the full MemTable, swap in a fresh one for new writes, and flush the frozen one, so writers are never blocked by disk I/O.
