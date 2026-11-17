@@ -2,7 +2,9 @@ include(GoogleTest)
 
 add_executable(distkv_tests
     coding_test.cpp
+    flush_test.cpp
     memtable_test.cpp
+    sstable_iterator_test.cpp
     sstable_test.cpp
     wal_test.cpp
 )
