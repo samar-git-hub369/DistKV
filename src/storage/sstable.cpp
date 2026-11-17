@@ -298,44 +298,102 @@ Status SSTableReader::ReadBlock(const BlockHandle& handle, std::string* contents
 Status SSTableReader::Get(std::string_view key, LookupResult* result, std::string* value,
                           uint64_t* seq) const {
     *result = LookupResult::kNotPresent;
+    if (blocks_.empty() || key < std::string_view(smallest_key_) ||
+        key > std::string_view(blocks_.back().last_key)) {
+        return Status::Ok();  // outside the table's key range: no disk read
+    }
 
-    // First block whose last key is >= key: the only block that can hold it.
-    const auto it = std::lower_bound(
-        blocks_.begin(), blocks_.end(), key,
-        [](const BlockHandle& h, std::string_view k) { return std::string_view(h.last_key) < k; });
-    if (it == blocks_.end() || key < std::string_view(smallest_key_)) {
+    SSTableIterator it(this);
+    it.Seek(key);
+    if (!it.status().ok()) {
+        return it.status();
+    }
+    if (!it.Valid() || it.key() != key) {
         return Status::Ok();
     }
-
-    std::string block;
-    Status s = ReadBlock(*it, &block);
-    if (!s.ok()) {
-        return s;
+    if (seq != nullptr) {
+        *seq = it.seq();
     }
-
-    std::string_view in(block);
-    ParsedEntry e{};
-    while (!in.empty()) {
-        if (!ParseEntry(&in, &e)) {
-            return Status::Corruption("malformed sstable entry in " + path_);
-        }
-        if (e.key < key) {
-            continue;
-        }
-        if (e.key == key) {
-            if (seq != nullptr) {
-                *seq = e.seq;
-            }
-            if (e.type == EntryType::kTombstone) {
-                *result = LookupResult::kDeleted;
-            } else {
-                value->assign(e.value.data(), e.value.size());
-                *result = LookupResult::kFound;
-            }
-        }
-        break;  // keys are sorted: past the target, it is not here
+    if (it.type() == EntryType::kTombstone) {
+        *result = LookupResult::kDeleted;
+    } else {
+        value->assign(it.value().data(), it.value().size());
+        *result = LookupResult::kFound;
     }
     return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Iterator
+
+bool SSTableIterator::LoadBlock(size_t index) {
+    block_index_ = index;
+    rest_ = {};
+    if (index >= table_->blocks_.size()) {
+        valid_ = false;
+        return false;
+    }
+    Status s = table_->ReadBlock(table_->blocks_[index], &block_);
+    if (!s.ok()) {
+        status_ = std::move(s);
+        valid_ = false;
+        return false;
+    }
+    rest_ = block_;
+    return true;
+}
+
+void SSTableIterator::Advance() {
+    while (rest_.empty()) {
+        if (!LoadBlock(block_index_ + 1)) {
+            return;
+        }
+    }
+    ParsedEntry e{};
+    if (!ParseEntry(&rest_, &e)) {
+        status_ = Status::Corruption("malformed sstable entry in " + table_->path_);
+        valid_ = false;
+        return;
+    }
+    key_ = e.key;
+    seq_ = e.seq;
+    type_ = e.type;
+    value_ = e.value;
+    valid_ = true;
+}
+
+void SSTableIterator::SeekToFirst() {
+    status_ = Status::Ok();
+    valid_ = false;
+    if (LoadBlock(0)) {
+        Advance();
+    }
+}
+
+void SSTableIterator::Seek(std::string_view target) {
+    status_ = Status::Ok();
+    valid_ = false;
+
+    // The first block whose last key is >= target is the first that can hold
+    // an entry >= target; every earlier block ends below it.
+    const auto& blocks = table_->blocks_;
+    const auto it = std::lower_bound(blocks.begin(), blocks.end(), target,
+                                     [](const SSTableReader::BlockHandle& h, std::string_view k) {
+                                         return std::string_view(h.last_key) < k;
+                                     });
+    if (!LoadBlock(static_cast<size_t>(it - blocks.begin()))) {
+        return;
+    }
+    Advance();
+    while (valid_ && key_ < target) {
+        Advance();
+    }
+}
+
+void SSTableIterator::Next() {
+    if (valid_) {
+        Advance();
+    }
 }
 
 }  // namespace distkv

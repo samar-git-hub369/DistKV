@@ -106,6 +106,8 @@ class SSTableReader {
     size_t block_count() const { return blocks_.size(); }
 
   private:
+    friend class SSTableIterator;
+
     struct BlockHandle {
         std::string last_key;
         uint64_t offset;
@@ -121,6 +123,55 @@ class SSTableReader {
     std::vector<BlockHandle> blocks_;
     uint64_t entry_count_ = 0;
     uint64_t max_seq_ = 0;
+};
+
+// Walks the entries of one SSTable in key order, tombstones included.
+//
+// Holds one data block in memory at a time. key() and value() point into that
+// block and stay valid only until the next call that moves the iterator. The
+// table must outlive the iterator. Each iterator is single-threaded, but many
+// iterators can read the same table at once.
+//
+//   SSTableIterator it(reader.get());
+//   for (it.Seek("user:"); it.Valid(); it.Next()) { ... }
+//   if (!it.status().ok()) { ... }   // stopped early on damage
+class SSTableIterator {
+  public:
+    explicit SSTableIterator(const SSTableReader* table) : table_(table) {}
+
+    void SeekToFirst();
+    // Positions at the first entry whose key is >= target.
+    void Seek(std::string_view target);
+    void Next();
+
+    // False past the last entry, before any Seek, or after an error.
+    bool Valid() const { return valid_; }
+    // Ok unless iteration stopped on a damaged block.
+    const Status& status() const { return status_; }
+
+    std::string_view key() const { return key_; }
+    uint64_t seq() const { return seq_; }
+    EntryType type() const { return type_; }
+    std::string_view value() const { return value_; }
+
+  private:
+    // Loads block `index` and positions before its first entry. Returns false
+    // past the last block or on error.
+    bool LoadBlock(size_t index);
+    // Decodes the next entry, crossing into later blocks as needed.
+    void Advance();
+
+    const SSTableReader* table_;
+    size_t block_index_ = 0;
+    std::string block_;
+    std::string_view rest_;  // undecoded tail of block_
+
+    bool valid_ = false;
+    Status status_;
+    std::string_view key_;
+    uint64_t seq_ = 0;
+    EntryType type_ = EntryType::kValue;
+    std::string_view value_;
 };
 
 // Marks the end of a valid table; a file missing it was never finished.
