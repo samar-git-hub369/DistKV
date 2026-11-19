@@ -308,5 +308,61 @@ TEST_F(SSTableTest, MatchesReferenceMapOnRandomData) {
     }
 }
 
+TEST_F(SSTableTest, BloomFilterSkipsMostMissingKeysWithoutReadingBlocks) {
+    std::vector<Row> rows;
+    for (int i = 0; i < 2000; ++i) {
+        rows.push_back({Key(i * 2), static_cast<uint64_t>(i + 1), EntryType::kValue, "v"});
+    }
+    Build(rows);
+    auto r = OpenOk();
+
+    LookupResult res;
+    std::string v;
+    // Odd keys sit inside the table's key range, so only the filter can skip them.
+    for (int i = 0; i < 2000; ++i) {
+        ASSERT_TRUE(r->Get(Key(i * 2 + 1), &res, &v).ok());
+        ASSERT_EQ(res, LookupResult::kNotPresent);
+    }
+    EXPECT_GT(r->bloom_skips(), 1940u);  // ~1% false positives allowed
+
+    // Present keys are never skipped.
+    const uint64_t skips = r->bloom_skips();
+    for (int i = 0; i < 2000; ++i) {
+        ASSERT_TRUE(r->MayContain(Key(i * 2)));
+        ASSERT_TRUE(r->Get(Key(i * 2), &res, &v).ok());
+        ASSERT_EQ(res, LookupResult::kFound);
+    }
+    EXPECT_EQ(r->bloom_skips(), skips);
+}
+
+TEST_F(SSTableTest, DisabledBloomFilterStillAnswersCorrectly) {
+    std::unique_ptr<SSTableWriter> w;
+    SSTableOptions opts;
+    opts.bloom_bits_per_key = 0;
+    ASSERT_TRUE(SSTableWriter::Create(path_, opts, &w).ok());
+    ASSERT_TRUE(w->Add("a", 1, EntryType::kValue, "1").ok());
+    ASSERT_TRUE(w->Add("c", 2, EntryType::kValue, "3").ok());
+    ASSERT_TRUE(w->Finish().ok());
+    auto r = OpenOk();
+
+    LookupResult res;
+    std::string v;
+    ASSERT_TRUE(r->Get("b", &res, &v).ok());
+    EXPECT_EQ(res, LookupResult::kNotPresent);
+    EXPECT_EQ(r->bloom_skips(), 0u);
+    ASSERT_TRUE(r->Get("c", &res, &v).ok());
+    EXPECT_EQ(res, LookupResult::kFound);
+}
+
+TEST_F(SSTableTest, DetectsDamagedFilterBlock) {
+    Build({{"a", 1, EntryType::kValue, "1"}, {"b", 2, EntryType::kValue, "2"}});
+    // The filter block ends right where the index starts; the index here is
+    // smallest key + one handle + crc = (4+1) + (4+1+8+4) + 4 = 26 bytes.
+    const uint64_t index_start = fs::file_size(path_) - kSSTableFooterSize - 26;
+    FlipByte(index_start - 6);  // inside the filter bits
+    std::unique_ptr<SSTableReader> r;
+    EXPECT_EQ(SSTableReader::Open(path_, &r).code(), StatusCode::kCorruption);
+}
+
 }  // namespace
 }  // namespace distkv

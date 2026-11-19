@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "storage/bloom_filter.h"
 #include "storage/lookup.h"
 
 // Sorted String Table: an immutable, sorted file of key/value entries.
@@ -16,21 +18,24 @@
 // When a MemTable fills up it is written out as one SSTable and never changed
 // again. Layout:
 //
-//   data block 0 | data block 1 | ... | index block | footer
+//   data block 0 | data block 1 | ... | filter block | index block | footer
 //
-//   data block  := entry* crc32:u32
-//   entry       := key_len:u32 key seq:u64 type:u8 value_len:u32 value
-//   index block := smallest_key(len-prefixed) handle* crc32:u32
-//   handle      := last_key(len-prefixed) offset:u64 size:u32
-//   footer      := index_offset:u64 index_size:u32 entry_count:u64
-//                  max_seq:u64 crc32:u32 magic:u64           (40 bytes)
+//   data block   := entry* crc32:u32
+//   entry        := key_len:u32 key seq:u64 type:u8 value_len:u32 value
+//   filter block := bloom_filter crc32:u32       (see bloom_filter.h)
+//   index block  := smallest_key(len-prefixed) handle* crc32:u32
+//   handle       := last_key(len-prefixed) offset:u64 size:u32
+//   footer       := index_offset:u64 index_size:u32 filter_offset:u64
+//                   filter_size:u32 entry_count:u64 max_seq:u64
+//                   crc32:u32 magic:u64                         (52 bytes)
 //
 // All integers are little-endian; every CRC covers the bytes before it in its
 // block. `size` in a handle excludes the trailing CRC.
 //
 // The index is sparse: one handle per data block (~4 KiB), not one per key. A
-// reader keeps the index in memory, binary-searches it to find the single
-// block that could hold a key, and reads only that block from disk.
+// reader keeps the index and the Bloom filter in memory. A lookup first asks
+// the filter, which rules out most missing keys with no I/O, then binary-
+// searches the index and reads the single block that could hold the key.
 namespace distkv {
 
 enum class EntryType : uint8_t {
@@ -41,6 +46,8 @@ enum class EntryType : uint8_t {
 struct SSTableOptions {
     // A data block is closed once its encoded entries reach this many bytes.
     size_t block_size = 4096;
+    // Bloom filter size; 10 bits per key gives ~1% false positives. 0 disables it.
+    int bloom_bits_per_key = 10;
 };
 
 // Builds an SSTable. Entries must be added in strictly increasing key order.
@@ -76,6 +83,7 @@ class SSTableWriter {
     std::string index_;     // encoded handles of finished blocks
     std::string last_key_;  // last key added, for the ordering check
     std::string smallest_key_;
+    BloomFilterBuilder bloom_;
     uint64_t offset_ = 0;
     uint64_t entry_count_ = 0;
     uint64_t max_seq_ = 0;
@@ -105,6 +113,11 @@ class SSTableReader {
     uint64_t max_seq() const { return max_seq_; }
     size_t block_count() const { return blocks_.size(); }
 
+    // False only if `key` is definitely not in this table.
+    bool MayContain(std::string_view key) const { return BloomMayContain(filter_, key); }
+    // Lookups answered by the Bloom filter alone, without reading a block.
+    uint64_t bloom_skips() const { return bloom_skips_.load(std::memory_order_relaxed); }
+
   private:
     friend class SSTableIterator;
 
@@ -121,8 +134,10 @@ class SSTableReader {
     const std::string path_;
     std::string smallest_key_;
     std::vector<BlockHandle> blocks_;
+    std::string filter_;
     uint64_t entry_count_ = 0;
     uint64_t max_seq_ = 0;
+    mutable std::atomic<uint64_t> bloom_skips_{0};
 };
 
 // Walks the entries of one SSTable in key order, tombstones included.
@@ -176,6 +191,6 @@ class SSTableIterator {
 
 // Marks the end of a valid table; a file missing it was never finished.
 inline constexpr uint64_t kSSTableMagic = 0x4453544b56535354ull;
-inline constexpr size_t kSSTableFooterSize = 40;
+inline constexpr size_t kSSTableFooterSize = 52;
 
 }  // namespace distkv

@@ -10,6 +10,7 @@
 #include "common/coding.h"
 #include "common/crc32.h"
 #include "common/file_util.h"
+#include "storage/bloom_filter.h"
 
 namespace distkv {
 namespace {
@@ -57,7 +58,11 @@ bool ParseEntry(std::string_view* in, ParsedEntry* out) {
 
 SSTableWriter::SSTableWriter(int fd, std::string path, std::string tmp_path,
                              SSTableOptions options)
-    : fd_(fd), path_(std::move(path)), tmp_path_(std::move(tmp_path)), options_(options) {}
+    : fd_(fd),
+      path_(std::move(path)),
+      tmp_path_(std::move(tmp_path)),
+      options_(options),
+      bloom_(options.bloom_bits_per_key) {}
 
 Status SSTableWriter::Create(const std::string& path, const SSTableOptions& options,
                              std::unique_ptr<SSTableWriter>* out) {
@@ -110,6 +115,7 @@ Status SSTableWriter::Add(std::string_view key, uint64_t seq, EntryType type,
     if (entry_count_ == 0) {
         smallest_key_.assign(key.data(), key.size());
     }
+    bloom_.AddKey(key);
     PutLengthPrefixed(&block_, key);
     PutFixed64(&block_, seq);
     block_.push_back(static_cast<char>(type));
@@ -155,6 +161,15 @@ Status SSTableWriter::Finish() {
         return s;
     }
 
+    std::string filter = bloom_.Finish();
+    const uint64_t filter_offset = offset_;
+    const auto filter_size = static_cast<uint32_t>(filter.size());
+    AppendCrc(&filter);
+    s = Write(filter);
+    if (!s.ok()) {
+        return s;
+    }
+
     std::string index;
     PutLengthPrefixed(&index, smallest_key_);
     index += index_;
@@ -169,6 +184,8 @@ Status SSTableWriter::Finish() {
     std::string footer;
     PutFixed64(&footer, index_offset);
     PutFixed32(&footer, index_size);
+    PutFixed64(&footer, filter_offset);
+    PutFixed32(&footer, filter_size);
     PutFixed64(&footer, entry_count_);
     PutFixed64(&footer, max_seq_);
     AppendCrc(&footer);
@@ -225,22 +242,40 @@ Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReade
     if (!s.ok()) {
         return s;
     }
-    if (DecodeFixed64(footer.data() + 32) != kSSTableMagic) {
+    constexpr size_t kChecked = kSSTableFooterSize - 8;  // everything but the magic
+    if (DecodeFixed64(footer.data() + kChecked) != kSSTableMagic) {
         return Status::Corruption("bad sstable magic: " + path);
     }
     std::string_view footer_contents;
-    if (!CheckCrc(std::string_view(footer).substr(0, 32), &footer_contents)) {
+    if (!CheckCrc(std::string_view(footer).substr(0, kChecked), &footer_contents)) {
         return Status::Corruption("sstable footer checksum mismatch: " + path);
     }
     const uint64_t index_offset = DecodeFixed64(footer.data());
     const uint32_t index_size = DecodeFixed32(footer.data() + 8);
-    reader->entry_count_ = DecodeFixed64(footer.data() + 12);
-    reader->max_seq_ = DecodeFixed64(footer.data() + 20);
+    const uint64_t filter_offset = DecodeFixed64(footer.data() + 12);
+    const uint32_t filter_size = DecodeFixed32(footer.data() + 20);
+    reader->entry_count_ = DecodeFixed64(footer.data() + 24);
+    reader->max_seq_ = DecodeFixed64(footer.data() + 32);
 
+    // Layout is data | filter | index | footer; check each region fits.
     if (index_offset > file_size - kSSTableFooterSize ||
         index_size + kCrcSize > file_size - kSSTableFooterSize - index_offset) {
         return Status::Corruption("sstable index out of bounds: " + path);
     }
+    if (filter_offset > index_offset || filter_size + kCrcSize > index_offset - filter_offset) {
+        return Status::Corruption("sstable filter out of bounds: " + path);
+    }
+
+    std::string raw_filter;
+    s = ReadAt(fd, filter_offset, filter_size + kCrcSize, &raw_filter, path);
+    if (!s.ok()) {
+        return s;
+    }
+    std::string_view filter;
+    if (!CheckCrc(raw_filter, &filter)) {
+        return Status::Corruption("sstable filter checksum mismatch: " + path);
+    }
+    reader->filter_.assign(filter.data(), filter.size());
 
     std::string raw_index;
     s = ReadAt(fd, index_offset, index_size + kCrcSize, &raw_index, path);
@@ -266,7 +301,7 @@ Status SSTableReader::Open(const std::string& path, std::unique_ptr<SSTableReade
         BlockHandle h{std::string(last_key), DecodeFixed64(index.data()),
                       DecodeFixed32(index.data() + 8)};
         index.remove_prefix(8 + 4);
-        if (h.offset > index_offset || h.size + kCrcSize > index_offset - h.offset) {
+        if (h.offset > filter_offset || h.size + kCrcSize > filter_offset - h.offset) {
             return Status::Corruption("sstable block out of bounds: " + path);
         }
         reader->blocks_.push_back(std::move(h));
@@ -301,6 +336,10 @@ Status SSTableReader::Get(std::string_view key, LookupResult* result, std::strin
     if (blocks_.empty() || key < std::string_view(smallest_key_) ||
         key > std::string_view(blocks_.back().last_key)) {
         return Status::Ok();  // outside the table's key range: no disk read
+    }
+    if (!BloomMayContain(filter_, key)) {
+        bloom_skips_.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok();  // definitely absent: no disk read
     }
 
     SSTableIterator it(this);
