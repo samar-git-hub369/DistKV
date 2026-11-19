@@ -25,7 +25,7 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] MemTable with tombstones, flush threshold and WAL recovery
 - [x] SSTable format: writer, sparse index, checksummed point lookups
 - [x] SSTable iteration and MemTable flush
-- [ ] Bloom filters and the storage engine read/write path
+- [x] Bloom filters and the storage engine read/write path
 - [ ] Background compaction
 - [ ] TCP server and text protocol
 - [ ] Raft: leader election, log replication, failover
@@ -92,4 +92,27 @@ footer      := index_offset:u64 index_size:u32 entry_count:u64 max_seq:u64 crc32
 
 `FlushMemTable` writes a MemTable, tombstones included, to a new SSTable in one sequential pass and reports the highest sequence number it made durable. Because the SSTable is published atomically, a flush either fully succeeds or leaves nothing behind. Once it succeeds, WAL records up to that sequence number are no longer needed for recovery.
 
-The storage engine (next) will freeze the full MemTable, swap in a fresh one for new writes, and flush the frozen one, so writers are never blocked by disk I/O.
+## Bloom filters
+
+Every SSTable carries a Bloom filter over its keys (10 bits per key by default, about 1% false positives), stored in a checksummed block between the data and the index. The reader keeps it in memory and checks it before touching the index, so a lookup for a key the table does not hold almost never reads from disk. That matters because a missing key would otherwise cost one block read in every SSTable.
+
+The filter uses double hashing: one 64-bit hash (FNV-1a with a splitmix64 finalizer) is split into two 32-bit halves, and probe *i* tests bit `(h1 + i·h2) mod m`. The number of probes is `bits_per_key · ln 2`, which minimises false positives. A missing or damaged filter answers "maybe" for every key, so it can cost an extra read but can never hide data.
+
+## Storage engine
+
+`StorageEngine` ties the pieces together for one node:
+
+```
+Put/Delete ─► WAL append ─► active MemTable
+                                │ full
+                                ▼
+                      frozen MemTable ─► background flush ─► NNNNNN.sst
+Get ─► active MemTable ─► frozen MemTable ─► SSTables, newest first (Bloom filter first)
+```
+
+- **Writes** are serialised by one mutex so WAL order equals sequence order. A write becomes visible to readers only after its WAL append returns.
+- **Freezing.** When the active MemTable reaches `memtable_bytes`, it is frozen, a new MemTable and WAL file take over, and a background thread flushes the frozen one. If the previous flush is still running, the writer waits; that is the engine's backpressure.
+- **Publishing.** The flush thread deletes the frozen MemTable's WAL once the SSTable is durable, then swaps in a new table list and drops the frozen MemTable under one lock, so a reader always finds the data in one place or the other.
+- **Reads** take the lock only to copy three pointers (active MemTable, frozen MemTable, table list); the search itself runs unlocked. The table list is copy-on-write, so a reader's snapshot stays valid while flushes publish new tables.
+- **Recovery.** `Open` removes leftover `.tmp` files, opens the SSTables, replays every WAL into one MemTable, flushes it, and deletes the WALs. If the process died after a flush published its SSTable but before deleting the WAL, that WAL's records have sequence numbers no higher than the newest SSTable's, so replay skips them; genuinely unflushed writes are always higher.
+- **Errors.** If a background flush fails, its MemTable stays readable and later writes fail fast with the error; the data is still in the WAL for the next `Open`.
