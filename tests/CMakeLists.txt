@@ -7,6 +7,7 @@ add_executable(distkv_tests
     memtable_test.cpp
     sstable_iterator_test.cpp
     sstable_test.cpp
+    storage_engine_test.cpp
     wal_test.cpp
 )
 
