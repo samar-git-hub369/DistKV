@@ -26,7 +26,7 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] SSTable format: writer, sparse index, checksummed point lookups
 - [x] SSTable iteration and MemTable flush
 - [x] Bloom filters and the storage engine read/write path
-- [ ] Background compaction
+- [x] Background compaction
 - [ ] TCP server and text protocol
 - [ ] Raft: leader election, log replication, failover
 - [ ] Benchmarks
@@ -116,3 +116,14 @@ Get ─► active MemTable ─► frozen MemTable ─► SSTables, newest first 
 - **Reads** take the lock only to copy three pointers (active MemTable, frozen MemTable, table list); the search itself runs unlocked. The table list is copy-on-write, so a reader's snapshot stays valid while flushes publish new tables.
 - **Recovery.** `Open` removes leftover `.tmp` files, opens the SSTables, replays every WAL into one MemTable, flushes it, and deletes the WALs. If the process died after a flush published its SSTable but before deleting the WAL, that WAL's records have sequence numbers no higher than the newest SSTable's, so replay skips them; genuinely unflushed writes are always higher.
 - **Errors.** If a background flush fails, its MemTable stays readable and later writes fail fast with the error; the data is still in the WAL for the next `Open`.
+
+## Compaction
+
+Every write adds a new version instead of updating in place, so the same key piles up across SSTables and deleted keys linger as tombstones. Reads slow down (more tables to check) and disk use grows. Compaction merges tables back into one.
+
+- **Trigger.** Once `compaction_trigger` SSTables exist (4 by default), a second background thread merges all of them. Flushes keep running meanwhile; tables they produce are newer than every input and are left alone. `CompactAll()` runs one on demand.
+- **Merge.** A `MergingIterator` walks every input in key order, returning versions of the same key newest first. The compactor keeps the first version of each key and skips the rest.
+- **Dropping tombstones.** A tombstone only matters while an older value for its key might exist. Because every older table is an input, the compactor drops tombstones along with the values they hid.
+- **Sequence numbers.** The output records the inputs' highest sequence number even if the entry carrying it was dropped. Otherwise compacting everything away could make recovery restart numbering from an older value.
+- **Ordering by sequence number.** The output takes a file number after any table flushed during the compaction, yet holds older data, so the engine orders tables by max sequence number rather than file number.
+- **Crash safety.** The output is published atomically, then the inputs are deleted. If the process dies in between, the inputs and output overlap; every version in the output is also in an input, so reads stay correct and the next compaction cleans up. Readers holding the old table list keep their open file descriptors, so deleting inputs never disrupts an in-flight read.
