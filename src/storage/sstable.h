@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,12 @@ class SSTableWriter {
 
     Status Add(std::string_view key, uint64_t seq, EntryType type, std::string_view value);
     Status Finish();
+
+    // Records that this table stands for writes up to `seq` even if it holds
+    // no entry that new. Compaction uses this: when newer versions and
+    // tombstones are dropped, the output must still report its inputs'
+    // highest sequence number, or recovery would lose track of it.
+    void RaiseMaxSeq(uint64_t seq) { max_seq_ = std::max(max_seq_, seq); }
 
     uint64_t entry_count() const { return entry_count_; }
 
