@@ -3,8 +3,10 @@ add_library(distkv_storage STATIC
     common/crc32.cpp
     common/file_util.cpp
     storage/bloom_filter.cpp
+    storage/compaction.cpp
     storage/flush.cpp
     storage/memtable.cpp
+    storage/merging_iterator.cpp
     storage/sstable.cpp
     storage/storage_engine.cpp
     storage/wal.cpp

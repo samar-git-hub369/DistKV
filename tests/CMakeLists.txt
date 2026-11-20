@@ -3,6 +3,7 @@ include(GoogleTest)
 add_executable(distkv_tests
     bloom_filter_test.cpp
     coding_test.cpp
+    compaction_test.cpp
     flush_test.cpp
     memtable_test.cpp
     sstable_iterator_test.cpp
