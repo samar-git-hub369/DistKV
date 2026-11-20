@@ -3,12 +3,14 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace distkv {
@@ -140,6 +142,7 @@ TEST_F(StorageEngineTest, FlushOfEmptyMemTableIsANoOp) {
 
 TEST_F(StorageEngineTest, FullMemTableFlushesInTheBackground) {
     options_.memtable_bytes = 16 * 1024;
+    options_.compaction_trigger = 0;  // count flushed tables without them being merged
     OpenEngine();
     for (int i = 0; i < 2000; ++i) {
         ASSERT_TRUE(engine_->Put("key" + std::to_string(i), std::string(100, 'x')).ok());
@@ -308,6 +311,167 @@ TEST_F(StorageEngineTest, ConcurrentWritersAndReadersWithBackgroundFlushes) {
             ASSERT_EQ(GetOrMissing("w" + std::to_string(w) + ":" + std::to_string(i)),
                       std::to_string(i));
         }
+    }
+}
+
+TEST_F(StorageEngineTest, BackgroundCompactionBoundsTableCount) {
+    options_.memtable_bytes = 8 * 1024;
+    options_.compaction_trigger = 4;
+    OpenEngine();
+    for (int i = 0; i < 4000; ++i) {
+        ASSERT_TRUE(engine_->Put("key" + std::to_string(i % 800), std::to_string(i)).ok());
+    }
+    ASSERT_TRUE(engine_->Flush().ok());
+    ASSERT_TRUE(engine_->CompactAll().ok());  // settle whatever is left
+
+    const EngineStats st = engine_->stats();
+    EXPECT_GT(st.compactions, 1u);  // background compactions ran during the writes
+    EXPECT_EQ(st.sstables, 1u);
+    EXPECT_EQ(CountFiles(".sst"), 1u);  // inputs were deleted
+    for (int k = 0; k < 800; ++k) {
+        // The last write to key k was at i = 3200 + k.
+        ASSERT_EQ(GetOrMissing("key" + std::to_string(k)), std::to_string(3200 + k)) << k;
+    }
+}
+
+TEST_F(StorageEngineTest, CompactionDropsDeletedKeysForGood) {
+    options_.compaction_trigger = 0;
+    OpenEngine();
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_TRUE(engine_->Put("k" + std::to_string(i), "v").ok());
+    }
+    ASSERT_TRUE(engine_->Flush().ok());
+    for (int i = 0; i < 100; i += 2) {
+        ASSERT_TRUE(engine_->Delete("k" + std::to_string(i)).ok());
+    }
+    ASSERT_TRUE(engine_->Flush().ok());
+    ASSERT_TRUE(engine_->CompactAll().ok());
+
+    // The surviving table holds only the 50 live keys: no values, no tombstones
+    // for the deleted ones.
+    std::unique_ptr<SSTableReader> table;
+    for (const auto& e : fs::directory_iterator(dir_)) {
+        if (e.path().extension() == ".sst") {
+            ASSERT_TRUE(SSTableReader::Open(e.path().string(), &table).ok());
+        }
+    }
+    ASSERT_NE(table, nullptr);
+    EXPECT_EQ(table->entry_count(), 50u);
+
+    OpenEngine();
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_EQ(GetOrMissing("k" + std::to_string(i)), i % 2 == 0 ? "<missing>" : "v") << i;
+    }
+}
+
+TEST_F(StorageEngineTest, SequenceNumbersSurviveCompactingEverythingAway) {
+    options_.compaction_trigger = 0;
+    OpenEngine();
+    ASSERT_TRUE(engine_->Put("k", "v").ok());
+    ASSERT_TRUE(engine_->Delete("k").ok());
+    ASSERT_TRUE(engine_->Flush().ok());
+    ASSERT_TRUE(engine_->CompactAll().ok());
+
+    OpenEngine();
+    EXPECT_EQ(engine_->stats().last_seq, 2u);  // not reset to 0 by an empty table
+    ASSERT_TRUE(engine_->Put("k2", "v2").ok());
+    EXPECT_EQ(engine_->stats().last_seq, 3u);
+}
+
+TEST_F(StorageEngineTest, CrashAfterCompactionBeforeDeletingInputsReadsCorrectly) {
+    // Builds the directory a crash would leave: two inputs, a table flushed
+    // while the compaction ran, and the compaction output under a higher file
+    // number than that flush even though it holds older data.
+    fs::create_directories(dir_);
+    auto make = [&](const std::string& name, std::vector<std::tuple<std::string, uint64_t, bool>> rows,
+                    uint64_t max_seq) {
+        std::unique_ptr<SSTableWriter> w;
+        ASSERT_TRUE(SSTableWriter::Create(dir_ + "/" + name, SSTableOptions{}, &w).ok());
+        for (auto& [key, seq, tomb] : rows) {
+            ASSERT_TRUE(w->Add(key, seq, tomb ? EntryType::kTombstone : EntryType::kValue,
+                               tomb ? "" : "v" + std::to_string(seq))
+                            .ok());
+        }
+        w->RaiseMaxSeq(max_seq);
+        ASSERT_TRUE(w->Finish().ok());
+    };
+    make("000001.sst", {{"gone", 1, false}, {"k", 2, false}}, 2);  // input, oldest
+    make("000002.sst", {{"gone", 3, true}, {"k", 4, false}}, 4);   // input
+    make("000003.sst", {{"k", 5, false}}, 5);                      // flushed during compaction
+    make("000004.sst", {{"k", 4, false}}, 4);                      // compaction output
+
+    options_.compaction_trigger = 0;
+    OpenEngine();
+    EXPECT_EQ(GetOrMissing("k"), "v5");          // newest flush wins over the output
+    EXPECT_EQ(GetOrMissing("gone"), "<missing>");  // the input's tombstone still applies
+
+    ASSERT_TRUE(engine_->CompactAll().ok());
+    EXPECT_EQ(GetOrMissing("k"), "v5");
+    EXPECT_EQ(GetOrMissing("gone"), "<missing>");
+    EXPECT_EQ(engine_->stats().sstables, 1u);
+}
+
+TEST_F(StorageEngineTest, ReadersAndWritersRunDuringCompaction) {
+    options_.memtable_bytes = 16 * 1024;
+    options_.compaction_trigger = 3;
+    OpenEngine();
+
+    constexpr int kKeys = 500;
+    for (int k = 0; k < kKeys; ++k) {
+        ASSERT_TRUE(engine_->Put("stable" + std::to_string(k), "s" + std::to_string(k)).ok());
+    }
+    std::atomic<bool> done{false};
+    std::atomic<int> bad{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 3; ++r) {
+        readers.emplace_back([&, r] {
+            std::string v;
+            int k = r;
+            while (!done.load()) {
+                k = (k + 7) % kKeys;
+                const Status s = engine_->Get("stable" + std::to_string(k), &v);
+                if (!s.ok() || v != "s" + std::to_string(k)) ++bad;
+            }
+        });
+    }
+    std::thread writer([&] {
+        for (int i = 0; i < 6000; ++i) {
+            if (!engine_->Put("churn" + std::to_string(i % 300), std::to_string(i)).ok()) ++bad;
+        }
+    });
+    writer.join();
+    done = true;
+    for (auto& t : readers) t.join();
+
+    EXPECT_EQ(bad.load(), 0);
+    EXPECT_GT(engine_->stats().compactions, 0u);
+    for (int k = 0; k < 300; ++k) {
+        ASSERT_EQ(GetOrMissing("churn" + std::to_string(k)), std::to_string(5700 + k));
+    }
+}
+
+TEST_F(StorageEngineTest, OpenCompactsWhenManyTablesAlreadyExist) {
+    options_.compaction_trigger = 0;
+    OpenEngine();
+    for (int t = 0; t < 5; ++t) {
+        ASSERT_TRUE(engine_->Put("k" + std::to_string(t), "v").ok());
+        ASSERT_TRUE(engine_->Flush().ok());
+    }
+    EXPECT_EQ(engine_->stats().sstables, 5u);
+
+    options_.compaction_trigger = 4;
+    OpenEngine();
+    // The background thread picks the work up on its own; wait for it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (engine_->stats().compactions == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(engine_->stats().compactions, 1u);
+    engine_.reset();
+    EXPECT_EQ(CountFiles(".sst"), 1u);
+    OpenEngine();
+    for (int t = 0; t < 5; ++t) {
+        EXPECT_EQ(GetOrMissing("k" + std::to_string(t)), "v");
     }
 }
 
