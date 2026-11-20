@@ -6,6 +6,7 @@
 #include <filesystem>
 
 #include "common/file_util.h"
+#include "storage/compaction.h"
 #include "storage/flush.h"
 
 namespace distkv {
@@ -76,6 +77,7 @@ Status StorageEngine::Open(const std::string& dir, const EngineOptions& options,
         return s;
     }
     engine->flush_thread_ = std::thread(&StorageEngine::FlushLoop, engine.get());
+    engine->compaction_thread_ = std::thread(&StorageEngine::CompactionLoop, engine.get());
     *out = std::move(engine);
     return Status::Ok();
 }
@@ -113,7 +115,9 @@ Status StorageEngine::Recover() {
     }
     next_file_number_ = max_number + 1;
 
-    // Open SSTables newest first.
+    // Open SSTables, then order them newest first by max sequence number (see
+    // the header for why not by file number). Opening in descending file
+    // order first makes the stable sort break ties toward the higher number.
     std::sort(sst_numbers.rbegin(), sst_numbers.rend());
     auto tables = std::make_shared<TableList>();
     uint64_t table_max_seq = 0;
@@ -126,6 +130,9 @@ Status StorageEngine::Recover() {
         table_max_seq = std::max(table_max_seq, reader->max_seq());
         tables->push_back(std::move(reader));
     }
+    std::stable_sort(tables->begin(), tables->end(), [](const auto& a, const auto& b) {
+        return a->max_seq() > b->max_seq();
+    });
 
     // Replay WALs oldest first, skipping writes some SSTable already holds.
     std::sort(wal_numbers.begin(), wal_numbers.end());
@@ -183,8 +190,12 @@ StorageEngine::~StorageEngine() {
         shutting_down_ = true;
     }
     flush_cv_.notify_all();
+    compact_cv_.notify_all();
     if (flush_thread_.joinable()) {
         flush_thread_.join();
+    }
+    if (compaction_thread_.joinable()) {
+        compaction_thread_.join();
     }
 }
 
@@ -297,6 +308,7 @@ void StorageEngine::FlushLoop() {
         imm_.reset();
         ++flushes_;
         flush_cv_.notify_all();
+        compact_cv_.notify_all();
     }
 }
 
@@ -355,6 +367,98 @@ Status StorageEngine::Flush() {
     return bg_error_;
 }
 
+void StorageEngine::CompactionLoop() {
+    if (options_.compaction_trigger == 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    while (true) {
+        compact_cv_.wait(lock, [this] {
+            return shutting_down_ ||
+                   (bg_error_.ok() && tables_->size() >= options_.compaction_trigger);
+        });
+        if (shutting_down_) {
+            return;
+        }
+        lock.unlock();
+        Status s = RunCompaction();
+        lock.lock();
+        if (!s.ok()) {
+            // Compaction never loses data, but a failure here (disk full, a
+            // damaged table) will hit writes too; surface it the same way.
+            if (bg_error_.ok()) {
+                bg_error_ = s;
+            }
+            flush_cv_.notify_all();
+            return;
+        }
+    }
+}
+
+Status StorageEngine::RunCompaction() {
+    std::lock_guard<std::mutex> compact_lock(compact_mu_);
+
+    std::shared_ptr<const TableList> inputs;
+    uint64_t out_number = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!bg_error_.ok()) {
+            return bg_error_;
+        }
+        inputs = tables_;
+        if (inputs->empty()) {
+            return Status::Ok();
+        }
+        out_number = next_file_number_++;
+        compacting_ = true;
+    }
+
+    // Every table that exists is an input; tables flushed from now on are
+    // newer. With nothing older left, tombstones have nothing to hide.
+    std::vector<const SSTableReader*> raw;
+    raw.reserve(inputs->size());
+    for (const auto& t : *inputs) {
+        raw.push_back(t.get());
+    }
+    const std::string out_path = SSTablePath(out_number);
+    CompactionStats compacted;
+    Status s = CompactTables(raw, out_path, options_.sstable, /*drop_tombstones=*/true,
+                             &compacted);
+    std::unique_ptr<SSTableReader> output;
+    if (s.ok()) {
+        s = SSTableReader::Open(out_path, &output);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        compacting_ = false;
+        if (!s.ok()) {
+            return s;
+        }
+        // Keep the tables flushed during the compaction (they sit in front of
+        // the inputs), then the output in place of all the inputs.
+        auto tables = std::make_shared<TableList>();
+        for (const auto& t : *tables_) {
+            if (std::find(inputs->begin(), inputs->end(), t) == inputs->end()) {
+                tables->push_back(t);
+            }
+        }
+        tables->push_back(std::move(output));
+        tables_ = std::move(tables);
+        ++compactions_;
+    }
+
+    // Readers that copied the old list keep their open file descriptors, so
+    // unlinking the inputs is safe while they finish.
+    for (const auto& t : *inputs) {
+        std::error_code ec;
+        fs::remove(t->path(), ec);
+    }
+    return Status::Ok();
+}
+
+Status StorageEngine::CompactAll() { return RunCompaction(); }
+
 EngineStats StorageEngine::stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     EngineStats st;
@@ -363,6 +467,8 @@ EngineStats StorageEngine::stats() const {
     st.memtable_bytes = mem_->ApproximateBytes();
     st.flush_in_progress = imm_ != nullptr;
     st.flushes = flushes_;
+    st.compactions = compactions_;
+    st.compaction_in_progress = compacting_;
     return st;
 }
 

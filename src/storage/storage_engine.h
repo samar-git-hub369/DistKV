@@ -37,12 +37,26 @@
 // deleting the WAL. Its records all carry sequence numbers no higher than the
 // newest SSTable's, while unflushed writes are always higher, so replay skips
 // anything at or below that mark.
+//
+// Compaction: once there are `compaction_trigger` SSTables, a second
+// background thread merges all of them into one, keeping only the newest
+// version of each key and dropping tombstones (safe because every older table
+// is an input). Tables flushed while it runs are newer and stay untouched.
+//
+// SSTables are ordered by max sequence number, not file number: a compaction
+// output takes a file number after any table flushed during the compaction,
+// yet holds older data. If the process dies after a compaction publishes its
+// output but before deleting the inputs, the inputs and output overlap; every
+// version in the output is also in an input, so reads stay correct and the
+// next compaction removes the duplicates.
 namespace distkv {
 
 struct EngineOptions {
     size_t memtable_bytes = 4u << 20;  // freeze and flush the MemTable at this size
     WalSyncMode wal_sync = WalSyncMode::kEveryAppend;
     SSTableOptions sstable;
+    // Compact once this many SSTables exist; 0 turns background compaction off.
+    size_t compaction_trigger = 4;
 };
 
 struct EngineStats {
@@ -51,6 +65,8 @@ struct EngineStats {
     size_t memtable_bytes = 0;
     bool flush_in_progress = false;
     uint64_t flushes = 0;
+    uint64_t compactions = 0;
+    bool compaction_in_progress = false;
 };
 
 class StorageEngine {
@@ -59,8 +75,8 @@ class StorageEngine {
     static Status Open(const std::string& dir, const EngineOptions& options,
                        std::unique_ptr<StorageEngine>* out);
 
-    // Waits for an in-progress flush to finish. Writes still in the active
-    // MemTable stay in its WAL and are recovered by the next Open.
+    // Waits for an in-progress flush and compaction to finish. Writes still in
+    // the active MemTable stay in its WAL and are recovered by the next Open.
     ~StorageEngine();
     StorageEngine(const StorageEngine&) = delete;
     StorageEngine& operator=(const StorageEngine&) = delete;
@@ -76,6 +92,10 @@ class StorageEngine {
     // MemTable is in an SSTable.
     Status Flush();
 
+    // Merges every SSTable into one now, in the calling thread. Waits if a
+    // background compaction is already running.
+    Status CompactAll();
+
     EngineStats stats() const;
     const std::string& dir() const { return dir_; }
 
@@ -88,6 +108,9 @@ class StorageEngine {
     // previous flush to finish first. Caller holds write_mu_.
     Status MakeRoomForWrite(bool force);
     void FlushLoop();
+    void CompactionLoop();
+    // Merges the current SSTables into one. Serialised by compact_mu_.
+    Status RunCompaction();
 
     std::string SSTablePath(uint64_t number) const;
     std::string WalPath(uint64_t number) const;
@@ -102,7 +125,8 @@ class StorageEngine {
     // Guards the fields below. Held only briefly; readers copy the pointers
     // they need and search without it.
     mutable std::mutex mu_;
-    std::condition_variable flush_cv_;  // imm_ set, imm_ cleared, or shutdown
+    std::condition_variable flush_cv_;    // imm_ set, imm_ cleared, or shutdown
+    std::condition_variable compact_cv_;  // tables_ grew, or shutdown
     std::shared_ptr<MemTable> mem_;
     std::shared_ptr<MemTable> imm_;  // frozen, being flushed; null if none
     uint64_t mem_wal_number_ = 0;
@@ -114,9 +138,15 @@ class StorageEngine {
     Status bg_error_;
     bool shutting_down_ = false;
     uint64_t flushes_ = 0;
+    uint64_t compactions_ = 0;
+    bool compacting_ = false;
+
+    // Held for a whole compaction so background and manual ones never overlap.
+    std::mutex compact_mu_;
 
     std::atomic<uint64_t> last_seq_{0};
     std::thread flush_thread_;
+    std::thread compaction_thread_;
 };
 
 }  // namespace distkv
