@@ -9,9 +9,11 @@ add_executable(distkv_tests
     sstable_iterator_test.cpp
     sstable_test.cpp
     storage_engine_test.cpp
+    tcp_server_test.cpp
+    text_protocol_test.cpp
     wal_test.cpp
 )
 
-target_link_libraries(distkv_tests PRIVATE distkv_storage distkv_warnings GTest::gtest_main)
+target_link_libraries(distkv_tests PRIVATE distkv_server distkv_storage distkv_warnings GTest::gtest_main)
 
 gtest_discover_tests(distkv_tests)
