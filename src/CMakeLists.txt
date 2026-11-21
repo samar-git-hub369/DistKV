@@ -15,3 +15,17 @@ add_library(distkv_storage STATIC
 target_include_directories(distkv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Threads REQUIRED)
 target_link_libraries(distkv_storage PUBLIC Threads::Threads PRIVATE distkv_warnings)
+
+# Networking and request handling on top of the storage engine.
+find_package(Boost 1.74 CONFIG REQUIRED)
+
+add_library(distkv_server STATIC
+    network/tcp_server.cpp
+    protocol/text_protocol.cpp
+    server/command_handler.cpp
+)
+target_include_directories(distkv_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(distkv_server PUBLIC distkv_storage Boost::headers PRIVATE distkv_warnings)
+
+add_executable(kvstore_server server/main.cpp)
+target_link_libraries(kvstore_server PRIVATE distkv_server distkv_warnings)
