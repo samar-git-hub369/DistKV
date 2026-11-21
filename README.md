@@ -27,7 +27,7 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] SSTable iteration and MemTable flush
 - [x] Bloom filters and the storage engine read/write path
 - [x] Background compaction
-- [ ] TCP server and text protocol
+- [x] TCP server and text protocol (Boost.Asio)
 - [ ] Raft: leader election, log replication, failover
 - [ ] Benchmarks
 - [ ] ML eviction model and in-process inference
@@ -36,13 +36,74 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 
 ## Building
 
-Requires CMake 3.20+ and a C++17 compiler (GCC or Clang). GoogleTest is fetched automatically.
+Requires CMake 3.20+, a C++17 compiler (GCC or Clang) and Boost 1.74+ (headers only, for Asio). GoogleTest is fetched automatically.
+
+```bash
+brew install boost                # macOS
+sudo apt-get install libboost-dev # Debian / Ubuntu
+```
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+## Running a node
+
+```bash
+./build/src/kvstore_server --port=7001 --data-dir=./data --threads=4
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host` | `0.0.0.0` | listen address |
+| `--port` | `7001` | client port |
+| `--data-dir` | `./data` | where WAL and SSTable files live |
+| `--threads` | `4` | io threads serving connections |
+| `--max-connections` | `1024` | extra clients get `ERR too many connections` |
+| `--memtable-mb` | `4` | MemTable flush threshold |
+| `--sync` | `always` | `always` fsyncs every write; `none` leaves it to the OS |
+
+SIGINT or SIGTERM stops it cleanly: connections are closed after their in-flight request, and the engine waits for any running flush or compaction.
+
+```console
+$ nc localhost 7001
+PUT city New Delhi
+OK
+GET city
+VALUE New Delhi
+DELETE city
+OK
+GET city
+NOT_FOUND
+STATUS
+STATUS role=standalone last_seq=2 sstables=0 memtable_bytes=68 flushes=0 compactions=0 requests=5
+```
+
+## Text protocol
+
+One request per line (`\n` or `\r\n`), one response line per request, in order.
+
+| Request | Response |
+|---|---|
+| `PUT <key> <value>` (alias `SET`) | `OK` — the value is the rest of the line, spaces included |
+| `GET <key>` | `VALUE <value>` or `NOT_FOUND` |
+| `DELETE <key>` (alias `DEL`) | `OK` |
+| `STATUS` | `STATUS key=value ...` |
+| `PING` | `PONG` |
+| anything malformed | `ERR <reason>` |
+
+Commands are case-insensitive; keys are case-sensitive and cannot contain spaces. Lines longer than 1 MiB get `ERR request line too long` and the connection is closed, since the rest of the stream can no longer be framed.
+
+## Networking
+
+`TcpServer` runs one Boost.Asio `io_context` on a pool of threads. Each connection gets its own strand, so its handlers never run concurrently while different connections are served in parallel.
+
+- **Read, handle, write, repeat.** A connection reads one line, runs it, writes the response, and only then reads the next line. Responses therefore come back in request order, and a client that stops reading stops being read from: natural backpressure with no unbounded queues. Pipelined requests wait in the connection's buffer.
+- **Bounded memory.** The read buffer is capped at 1 MiB per connection, and the connection limit caps how many buffers exist.
+- **Shutdown.** `Stop()` closes the acceptor and posts a close onto every connection's strand, then lets the worker threads drain and exit. Sessions are tracked through weak pointers, so shutdown never keeps a closing connection alive or touches one being destroyed.
+- **Backend interface.** Requests go through a `KvBackend` interface. Today `StandaloneBackend` calls the local `StorageEngine` directly; with Raft, a replicated backend will take its place without the network layer changing.
 
 ## Write-ahead log
 
