@@ -34,6 +34,7 @@ target_link_libraries(kvstore_server PRIVATE distkv_server distkv_warnings)
 add_library(distkv_raft STATIC
     raft/hard_state.cpp
     raft/raft_log.cpp
+    raft/raft_rpc.cpp
     raft/raft_types.cpp
 )
 target_include_directories(distkv_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
