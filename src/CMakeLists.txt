@@ -29,3 +29,11 @@ target_link_libraries(distkv_server PUBLIC distkv_storage Boost::headers PRIVATE
 
 add_executable(kvstore_server server/main.cpp)
 target_link_libraries(kvstore_server PRIVATE distkv_server distkv_warnings)
+
+# Raft consensus: persistent log, term/vote state and RPC messages.
+add_library(distkv_raft STATIC
+    raft/hard_state.cpp
+    raft/raft_types.cpp
+)
+target_include_directories(distkv_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(distkv_raft PUBLIC distkv_storage PRIVATE distkv_warnings)
