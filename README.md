@@ -28,6 +28,7 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] Bloom filters and the storage engine read/write path
 - [x] Background compaction
 - [x] TCP server and text protocol (Boost.Asio)
+- [x] Raft: persistent log, term/vote state, RPC messages
 - [ ] Raft: leader election, log replication, failover
 - [ ] Benchmarks
 - [ ] ML eviction model and in-process inference
@@ -188,3 +189,15 @@ Every write adds a new version instead of updating in place, so the same key pil
 - **Sequence numbers.** The output records the inputs' highest sequence number even if the entry carrying it was dropped. Otherwise compacting everything away could make recovery restart numbering from an older value.
 - **Ordering by sequence number.** The output takes a file number after any table flushed during the compaction, yet holds older data, so the engine orders tables by max sequence number rather than file number.
 - **Crash safety.** The output is published atomically, then the inputs are deleted. If the process dies in between, the inputs and output overlap; every version in the output is also in an input, so reads stay correct and the next compaction cleans up. Readers holding the old table list keep their open file descriptors, so deleting inputs never disrupts an in-flight read.
+
+## Raft: log, state and messages
+
+Replication is built on Raft. The first layer is everything a node must keep on disk and send over the wire; the election and replication logic sit on top of it.
+
+- **Log entries** carry a term, an index and one operation: `Put`, `Delete`, or `Noop` (which a new leader appends to commit entries from earlier terms). Indexes start at 1; the empty log has index 0 and term 0.
+- **The log file** (`raft/raft_log.h`) is an append-only sequence of checksummed frames, like the WAL. `Open` checks that indexes are consecutive and terms never decrease, cuts off a frame torn by a crash, and reports damage anywhere else as corruption. With sync on, an append is durable before it returns, which Raft requires before a node acknowledges it.
+- **Removing a suffix.** Unlike the WAL, a Raft log can lose entries from its end: a follower that disagrees with the leader drops its conflicting tail. The file offset of each entry is kept in memory, so this is one `ftruncate`.
+- **Following the leader.** `AppendFromLeader` skips entries the follower already has with the same term, truncates at the first entry whose term differs, and appends the rest. It never truncates when nothing conflicts, so a delayed, duplicated AppendEntries cannot erase newer entries.
+- **Term and vote** (`raft/hard_state.h`) live in a 24-byte checksummed file replaced atomically (temp file, fsync, rename, directory fsync). Losing the vote across a restart could let a node vote twice in a term and elect two leaders, so a damaged file is an error, never a silent reset.
+- **RPC messages** (`raft/raft_rpc.h`): `RequestVote` and `AppendEntries` with their responses, encoded as `length:u32 crc32:u32 type:u8 body`. The decoder works on a growing buffer and answers *ok*, *incomplete* or *corrupt*, so a transport can feed it raw socket reads. Lengths above 64 MiB, unknown types, trailing bytes and entries that do not follow `prev_log_index` are rejected even when the checksum matches.
+- **Election restriction.** A node only votes for a candidate whose log is at least as up to date as its own: a later last term wins, and with equal terms the longer log wins. This is what guarantees a new leader already holds every committed entry.
