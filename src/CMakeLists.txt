@@ -32,6 +32,7 @@ target_link_libraries(kvstore_server PRIVATE distkv_server distkv_warnings)
 
 # Raft consensus: log, term/vote state, RPC messages, election and peer transport.
 add_library(distkv_raft STATIC
+    raft/asio_transport.cpp
     raft/hard_state.cpp
     raft/raft_log.cpp
     raft/raft_node.cpp
