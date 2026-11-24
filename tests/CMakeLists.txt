@@ -7,7 +7,9 @@ add_executable(distkv_tests
     flush_test.cpp
     memtable_test.cpp
     raft_log_test.cpp
+    raft_node_test.cpp
     raft_rpc_test.cpp
+    raft_transport_test.cpp
     sstable_iterator_test.cpp
     sstable_test.cpp
     storage_engine_test.cpp
