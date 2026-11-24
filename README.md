@@ -29,7 +29,8 @@ A distributed key-value store written from scratch in C++17: an LSM-tree storage
 - [x] Background compaction
 - [x] TCP server and text protocol (Boost.Asio)
 - [x] Raft: persistent log, term/vote state, RPC messages
-- [ ] Raft: leader election, log replication, failover
+- [x] Raft: leader election, heartbeats and peer transport (Boost.Asio)
+- [ ] Raft: log replication, commit and failover
 - [ ] Benchmarks
 - [ ] ML eviction model and in-process inference
 - [ ] FastAPI, natural-language queries, dashboard
@@ -81,6 +82,18 @@ NOT_FOUND
 STATUS
 STATUS role=standalone last_seq=2 sstables=0 memtable_bytes=68 flushes=0 compactions=0 requests=5
 ```
+
+### Joining a Raft group
+
+Give each node an id, a peer port and the other members:
+
+```bash
+./build/src/kvstore_server --port=7001 --data-dir=./n1 --node-id=1 --raft-port=7101 --peers=2@127.0.0.1:7102,3@127.0.0.1:7103
+./build/src/kvstore_server --port=7002 --data-dir=./n2 --node-id=2 --raft-port=7102 --peers=1@127.0.0.1:7101,3@127.0.0.1:7103
+./build/src/kvstore_server --port=7003 --data-dir=./n3 --node-id=3 --raft-port=7103 --peers=1@127.0.0.1:7101,2@127.0.0.1:7102
+```
+
+Each node prints its role as it changes (`raft: node 3 is leader in term 1`). Stop the leader and one of the others takes over within about a second. Client requests are still served from each node's local storage; routing writes through the leader comes with log replication.
 
 ## Text protocol
 
@@ -201,3 +214,15 @@ Replication is built on Raft. The first layer is everything a node must keep on 
 - **Term and vote** (`raft/hard_state.h`) live in a 24-byte checksummed file replaced atomically (temp file, fsync, rename, directory fsync). Losing the vote across a restart could let a node vote twice in a term and elect two leaders, so a damaged file is an error, never a silent reset.
 - **RPC messages** (`raft/raft_rpc.h`): `RequestVote` and `AppendEntries` with their responses, encoded as `length:u32 crc32:u32 type:u8 body`. The decoder works on a growing buffer and answers *ok*, *incomplete* or *corrupt*, so a transport can feed it raw socket reads. Lengths above 64 MiB, unknown types, trailing bytes and entries that do not follow `prev_log_index` are rejected even when the checksum matches.
 - **Election restriction.** A node only votes for a candidate whose log is at least as up to date as its own: a later last term wins, and with equal terms the longer log wins. This is what guarantees a new leader already holds every committed entry.
+
+## Raft: leader election
+
+`RaftNode` (`raft/raft_node.h`) runs elections and heartbeats; `AsioTransport` (`raft/asio_transport.h`) carries its messages between processes.
+
+- **Timeouts.** A follower that hears nothing from a leader for a random 300–600 ms becomes a candidate: it increments the term, votes for itself and sends `RequestVote` to every peer. The randomness makes it unlikely two nodes start at once and split the vote; if they do, both time out again at different moments.
+- **Voting.** A node grants at most one vote per term, only to a candidate whose log is at least as up to date as its own, and saves the vote to disk before replying. Any message with a higher term makes the receiver adopt that term and step down to follower.
+- **Leadership.** A majority of votes (2 of 3, 3 of 5) makes a candidate leader. It immediately sends empty `AppendEntries` as heartbeats and repeats them every 75 ms, which resets the followers' election timers. A candidate that receives `AppendEntries` from a leader of its own term steps down.
+- **Partitions.** A leader cut off from the majority keeps believing it leads, but a new leader is elected on the majority side in a higher term. When the partition heals, the old leader sees that term and steps down. A node isolated on its own keeps starting elections but can never win one.
+- **Follower log handling.** `AppendEntries` is checked against the follower's log at `prev_log_index`. On a mismatch the follower answers with a `conflict_index` (the end of its log, or the first index of the conflicting term) so the leader can skip back a whole term at a time. Matching entries are appended, and the commit index only advances to entries known to match the leader's.
+- **Threading.** One mutex guards a node's state. Messages arrive on the transport's thread through `Step`, and a ticker thread sleeps until the next election deadline or heartbeat. Sends only queue, so holding the lock while sending cannot deadlock.
+- **Transport.** Each node opens one outgoing TCP connection per peer and reads from incoming ones, so requests and replies travel on different sockets; messages name their sender, so no handshake is needed. Delivery is best effort: a peer that is down is retried at most every 100 ms and messages for it are dropped meanwhile, since Raft resends anyway. Queues are bounded, a connection sending a malformed frame is closed, and a peer that restarts is reconnected automatically.
